@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -294,6 +295,21 @@ def _human_bytes(value: float) -> str:
     return f"{value:.1f} B"
 
 
+def telegram_file_download_url(settings: Settings, file_path: str) -> str:
+    """Build a download URL from Telegram's relative path or absolute URL response."""
+    path = file_path.strip()
+    if not path:
+        raise ValueError("Telegram returned an empty file path.")
+    parsed = urlsplit(path)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Telegram returned an invalid absolute file URL.")
+        return path
+    # Telegram's URL shape is /file/bot<TOKEN>/<file_path>; there is no slash
+    # between the literal "bot" prefix and the token.
+    return f"{settings.telegram_file_base_url.rstrip('/')}{settings.telegram_bot_token}/{path.lstrip('/')}"
+
+
 async def download_file_with_progress(
     settings: Settings,
     file_path: str | None,
@@ -312,7 +328,7 @@ async def download_file_with_progress(
     """
     if not file_path:
         raise RuntimeError("Telegram did not return a downloadable file path.")
-    url = f"{settings.telegram_file_base_url}/{settings.telegram_bot_token}/{file_path.lstrip('/')}"
+    url = telegram_file_download_url(settings, file_path)
     started = time.monotonic()
     last_update = 0.0
     received = 0
@@ -489,7 +505,13 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         temporary_path.replace(final_path)
     except Exception:
-        LOGGER.exception("Telegram download failed user_id=%s filename=%s", update.effective_user.id, filename)
+        # HTTP client exceptions include the request URL; never emit the bot token
+        # through a traceback or exception string.
+        detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
+        LOGGER.error(
+            "Telegram download failed user_id=%s filename=%s error_type=%s detail=%s",
+            update.effective_user.id, filename, type(exc).__name__, detail,
+        )
         try:
             temporary_path.unlink(missing_ok=True)
         except OSError:

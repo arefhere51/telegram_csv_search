@@ -17,7 +17,7 @@ from database import (
 from import_csv import import_one_file
 from search import parse_raw_fields, search_records
 from upload_manager import safe_upload_path
-from bot import full_results_csv_bytes, page_needs_full_csv
+from bot import full_results_csv_bytes, page_needs_full_csv, telegram_file_download_url
 
 
 class ImportAndSearchTests(unittest.TestCase):
@@ -140,6 +140,15 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["name"], "مریم")
         self.assertEqual(result.rows[0]["source_line"], 2)
         self.assertEqual(parse_raw_fields(result.rows[0])[3], "خط اول\r\nخط دوم، تهران")
+
+    def test_telegram_file_url_handles_relative_and_absolute_paths(self) -> None:
+        relative = telegram_file_download_url(self.settings, "documents/file_7.csv")
+        self.assertEqual(
+            relative,
+            "https://api.telegram.org/file/botunused-in-tests/documents/file_7.csv",
+        )
+        absolute = "https://api.telegram.org/file/botunused-in-tests/documents/file_7.csv"
+        self.assertEqual(telegram_file_download_url(self.settings, absolute), absolute)
 
     def test_selected_columns_only_are_searchable_but_full_row_is_hydrated(self) -> None:
         source = self.data_directory / "selected.csv"
