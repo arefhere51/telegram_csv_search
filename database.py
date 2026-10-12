@@ -10,7 +10,11 @@ from typing import Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
+
+
+class DatabaseRebuildRequired(RuntimeError):
+    """Raised when an old database cannot safely serve offset-backed records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,15 +64,39 @@ def transaction(connection: sqlite3.Connection) -> Iterator[None]:
 
 
 def initialize_database(connection: sqlite3.Connection) -> None:
-    """Create durable tables. Search indexes are built after first import."""
-    # Add columns before creating content-backed FTS tables so an existing
-    # installation can be upgraded without dropping its records.
+    """Create the offset-backed schema or reject an incompatible legacy database.
+
+    Version 1 stored complete source rows in ``records.raw_fields_json`` and did not
+    have byte offsets. There is no safe way to infer exact byte ranges from that data,
+    especially for quoted multiline CSV records, so those databases must be rebuilt
+    from their source CSV files.
+    """
     existing_records = {row[1] for row in connection.execute("PRAGMA table_info(records)")}
-    if existing_records and "search_text_norm" not in existing_records:
-        connection.execute("ALTER TABLE records ADD COLUMN search_text_norm TEXT NOT NULL DEFAULT ''")
-    existing_files = {row[1] for row in connection.execute("PRAGMA table_info(imported_files)")}
-    if existing_files and "headers_json" not in existing_files:
-        connection.execute("ALTER TABLE imported_files ADD COLUMN headers_json TEXT NOT NULL DEFAULT '[]'")
+    metadata_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
+    ).fetchone()
+    stored_version = None
+    if metadata_exists:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        stored_version = str(row[0]) if row else None
+    required_offset_columns = {"byte_offset_start", "byte_offset_end"}
+    if existing_records and (
+        "raw_fields_json" in existing_records
+        or not required_offset_columns.issubset(existing_records)
+    ):
+        raise DatabaseRebuildRequired(
+            "Legacy SQLite schema detected. This version reads result rows directly "
+            "from CSV byte offsets, so the existing database cannot be migrated safely. "
+            "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
+            "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
+        )
+    if stored_version not in {None, "2", SCHEMA_VERSION}:
+        raise DatabaseRebuildRequired(
+            f"Unsupported SQLite schema version {stored_version!r}; expected "
+            f"2 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+        )
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -80,6 +108,11 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY,
             relative_path TEXT NOT NULL UNIQUE,
             headers_json TEXT NOT NULL DEFAULT '[]',
+            column_names_json TEXT NOT NULL DEFAULT '[]',
+            selected_columns_json TEXT NOT NULL DEFAULT '[]',
+            csv_encoding TEXT NOT NULL,
+            csv_delimiter TEXT NOT NULL,
+            has_header INTEGER NOT NULL DEFAULT 0 CHECK (has_header IN (0, 1)),
             file_size INTEGER NOT NULL,
             modified_time_ns INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('importing', 'completed', 'failed')),
@@ -87,26 +120,29 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             last_line INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL,
             completed_at TEXT,
-            error_message TEXT
+            error_message TEXT,
+            telegram_file_id TEXT,
+            telegram_file_unique_id TEXT,
+            telegram_filename TEXT,
+            telegram_file_size INTEGER,
+            telegram_uploader_id INTEGER,
+            telegram_chat_id INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS records (
             id INTEGER PRIMARY KEY,
             source_file_id INTEGER NOT NULL REFERENCES imported_files(id) ON DELETE CASCADE,
             source_line INTEGER NOT NULL,
-            column_1 TEXT NOT NULL DEFAULT '',
-            column_2 TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL DEFAULT '',
-            birth_date TEXT NOT NULL DEFAULT '',
-            phone TEXT NOT NULL DEFAULT '',
+            byte_offset_start INTEGER NOT NULL CHECK (byte_offset_start >= 0),
+            byte_offset_end INTEGER NOT NULL CHECK (byte_offset_end > byte_offset_start),
             column_1_norm TEXT NOT NULL DEFAULT '',
             column_2_norm TEXT NOT NULL DEFAULT '',
             name_norm TEXT NOT NULL DEFAULT '',
             birth_date_norm TEXT NOT NULL DEFAULT '',
             phone_norm TEXT NOT NULL DEFAULT '',
-            raw_fields_json TEXT NOT NULL DEFAULT '[]',
             search_text_norm TEXT NOT NULL DEFAULT '',
-            record_hash TEXT NOT NULL
+            record_hash TEXT NOT NULL,
+            UNIQUE(source_file_id, byte_offset_start)
         );
 
         CREATE TABLE IF NOT EXISTS dedupe_hashes (
@@ -116,13 +152,6 @@ def initialize_database(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file_id);
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-            name_norm,
-            content='records',
-            content_rowid='id',
-            tokenize='unicode61 remove_diacritics 2',
-            prefix='2 3 4 5 6 8'
-        );
         CREATE VIRTUAL TABLE IF NOT EXISTS records_all_fts USING fts5(
             search_text_norm,
             content='records',
@@ -132,21 +161,27 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         );
         """
     )
-    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(imported_files)")}
-    migrations = {
-        "headers_json": "ALTER TABLE imported_files ADD COLUMN headers_json TEXT NOT NULL DEFAULT '[]'",
-        "telegram_file_id": "ALTER TABLE imported_files ADD COLUMN telegram_file_id TEXT",
-        "telegram_file_unique_id": "ALTER TABLE imported_files ADD COLUMN telegram_file_unique_id TEXT",
-        "telegram_filename": "ALTER TABLE imported_files ADD COLUMN telegram_filename TEXT",
-        "telegram_file_size": "ALTER TABLE imported_files ADD COLUMN telegram_file_size INTEGER",
-        "telegram_uploader_id": "ALTER TABLE imported_files ADD COLUMN telegram_uploader_id INTEGER",
-        "telegram_chat_id": "ALTER TABLE imported_files ADD COLUMN telegram_chat_id INTEGER",
-    }
-    for column, statement in migrations.items():
-        if column not in existing_columns:
-            connection.execute(statement)
+    imported_columns = {row[1] for row in connection.execute("PRAGMA table_info(imported_files)")}
+    if "selected_columns_json" not in imported_columns:
+        connection.execute(
+            "ALTER TABLE imported_files ADD COLUMN selected_columns_json TEXT NOT NULL DEFAULT '[]'"
+        )
+        # Version 2 indexed every source column. Preserve that behavior when migrating
+        # existing data; new imports can narrow their indexed columns explicitly.
+        import json
+        for row in connection.execute("SELECT id, column_names_json FROM imported_files").fetchall():
+            try:
+                names = json.loads(row[1] or "[]")
+                indexes = list(range(len(names))) if isinstance(names, list) else []
+            except (TypeError, ValueError):
+                indexes = []
+            connection.execute(
+                "UPDATE imported_files SET selected_columns_json = ? WHERE id = ?",
+                (json.dumps(indexes), row[0]),
+            )
     connection.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)",
+        "INSERT INTO metadata(key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (SCHEMA_VERSION,),
     )
     connection.execute(
@@ -176,7 +211,6 @@ def build_search_indexes(connection: sqlite3.Connection, *, force: bool = False)
     """Build exact/prefix B-tree indexes and rebuild FTS after an initial bulk import."""
     if search_indexes_ready(connection) and not force:
         return
-    connection.execute("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
     connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
     connection.executescript(
         """
@@ -225,16 +259,24 @@ def mark_file_importing(
     modified_time_ns: int,
     telegram_metadata: dict[str, object] | None = None,
     headers_json: str = "[]",
+    column_names_json: str = "[]",
+    csv_encoding: str = "utf-8-sig",
+    csv_delimiter: str = ",",
 ) -> int:
     now = utc_now()
     connection.execute(
         """
         INSERT INTO imported_files (
-            relative_path, headers_json, file_size, modified_time_ns, status, rows_imported,
-            last_line, started_at, completed_at, error_message
-        ) VALUES (?, ?, ?, ?, 'importing', 0, 0, ?, NULL, NULL)
+            relative_path, headers_json, column_names_json, csv_encoding, csv_delimiter,
+            file_size, modified_time_ns, status, rows_imported, last_line, started_at,
+            completed_at, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'importing', 0, 0, ?, NULL, NULL)
         ON CONFLICT(relative_path) DO UPDATE SET
             headers_json = excluded.headers_json,
+            column_names_json = excluded.column_names_json,
+            csv_encoding = excluded.csv_encoding,
+            csv_delimiter = excluded.csv_delimiter,
+            has_header = 0,
             file_size = excluded.file_size,
             modified_time_ns = excluded.modified_time_ns,
             status = 'importing',
@@ -244,7 +286,16 @@ def mark_file_importing(
             completed_at = NULL,
             error_message = NULL
         """,
-        (relative_path, headers_json, file_size, modified_time_ns, now),
+        (
+            relative_path,
+            headers_json,
+            column_names_json,
+            csv_encoding,
+            csv_delimiter,
+            file_size,
+            modified_time_ns,
+            now,
+        ),
     )
     row = connection.execute(
         "SELECT id FROM imported_files WHERE relative_path = ?", (relative_path,)
@@ -262,6 +313,25 @@ def mark_file_importing(
         )
     connection.commit()
     return int(row[0])
+
+
+def update_file_csv_metadata(
+    connection: sqlite3.Connection,
+    file_id: int,
+    *,
+    headers_json: str,
+    column_names_json: str,
+    selected_columns_json: str,
+    has_header: bool,
+) -> None:
+    """Persist the parser and search-selection metadata for source hydration."""
+    connection.execute(
+        """UPDATE imported_files
+           SET headers_json = ?, column_names_json = ?, selected_columns_json = ?, has_header = ?
+           WHERE id = ?""",
+        (headers_json, column_names_json, selected_columns_json, int(has_header), file_id),
+    )
+    connection.commit()
 
 
 def update_import_progress(
@@ -309,11 +379,6 @@ def remove_records_for_source(connection: sqlite3.Connection, source_file_id: in
         (source_file_id,),
     )
     if search_indexes_ready(connection):
-        connection.execute(
-            """INSERT INTO records_fts(records_fts, rowid, name_norm)
-               SELECT 'delete', id, name_norm FROM records WHERE source_file_id = ?""",
-            (source_file_id,),
-        )
         connection.execute(
             """INSERT INTO records_all_fts(records_all_fts, rowid, search_text_norm)
                SELECT 'delete', id, search_text_norm FROM records WHERE source_file_id = ?""",
@@ -366,32 +431,27 @@ def insert_record_batch(
             retained = list(rows)
 
         if retained:
-            cursor = connection.executemany(
+            connection.executemany(
                 """INSERT INTO records(
-                    source_file_id, source_line, column_1, column_2, name, birth_date, phone,
+                    source_file_id, source_line, byte_offset_start, byte_offset_end,
                     column_1_norm, column_2_norm, name_norm, birth_date_norm, phone_norm,
-                    raw_fields_json, search_text_norm, record_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    search_text_norm, record_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 retained,
             )
             # sqlite3.executemany() does not reliably expose all generated IDs. Retrieve by
-            # the file/line pairs (unique for this importer) after the insert instead.
+            # the file/start-offset pairs after the insert instead.
             if update_fts:
                 for row in retained:
-                    source_id, source_line = row[0], row[1]
+                    source_id, byte_offset_start = row[0], row[2]
                     record = connection.execute(
-                        "SELECT id, name_norm FROM records "
-                        "WHERE source_file_id = ? AND source_line = ?",
-                        (source_id, source_line),
+                        "SELECT id, search_text_norm FROM records "
+                        "WHERE source_file_id = ? AND byte_offset_start = ?",
+                        (source_id, byte_offset_start),
                     ).fetchone()
                     connection.execute(
-                        "INSERT INTO records_fts(rowid, name_norm) VALUES (?, ?)",
-                        (record["id"], record["name_norm"]),
-                    )
-                    connection.execute(
-                        "INSERT INTO records_all_fts(rowid, search_text_norm) "
-                        "SELECT id, search_text_norm FROM records WHERE id = ?",
-                        (record["id"],),
+                        "INSERT INTO records_all_fts(rowid, search_text_norm) VALUES (?, ?)",
+                        (record["id"], record["search_text_norm"]),
                     )
     return len(retained)
 

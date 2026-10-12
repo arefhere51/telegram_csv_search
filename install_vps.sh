@@ -12,7 +12,7 @@ NO_START=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log() { printf '\n%b[%s]%b %s\n' "$BLUE" "$(date '+%F %T')" "$NC" "$*"; }
-warn() { printf '%b%s%b\n' "$YELLOW" "$*" "$NC" >&2; }
+warn() { printf '%b%s%b\n' "$YELLOW" "$*" "$NC"; }
 die() { printf '\n%bERROR:%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
 usage() {
@@ -102,7 +102,6 @@ CSV_DELIMITER="$(ask_value "CSV delimiter (one character)" ",")"
 [[ ${#CSV_DELIMITER} -eq 1 ]] || die "CSV delimiter must be exactly one character."
 CSV_ENCODING="$(ask_value "CSV encoding" "utf-8-sig")"
 UPLOAD_ENABLED="$(ask_yes_no "Allow authorized private-chat CSV uploads?" "y")"
-DELETE_AFTER_IMPORT="$(ask_yes_no "Delete CSV after successful import?" "n")"
 LOCAL_API_ENABLED="$(ask_yes_no "Use a Local Bot API Server for files larger than 20 MB?" "n")"
 TELEGRAM_BASE_URL="https://api.telegram.org/bot"
 TELEGRAM_FILE_BASE_URL="https://api.telegram.org/file/bot"
@@ -151,7 +150,8 @@ LOG_LEVEL=INFO
 UPLOAD_ENABLED=$UPLOAD_ENABLED
 UPLOAD_MAX_BYTES=2000000000
 UPLOAD_PROGRESS_INTERVAL_SECONDS=3
-DELETE_CSV_AFTER_IMPORT=$DELETE_AFTER_IMPORT
+# CSV is the authoritative data source and must remain available for search hydration.
+DELETE_CSV_AFTER_IMPORT=false
 TELEGRAM_BASE_URL=$TELEGRAM_BASE_URL
 TELEGRAM_FILE_BASE_URL=$TELEGRAM_FILE_BASE_URL
 EOF

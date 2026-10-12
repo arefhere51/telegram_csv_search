@@ -7,16 +7,16 @@ loads a source file as a whole and can safely re-run after an interrupted import
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import hashlib
 import json
-import itertools
 import logging
 from pathlib import Path
 import sqlite3
 import sys
 import time
-from typing import Callable, Iterable
+from typing import BinaryIO, Callable, Iterator
 
 from config import ConfigurationError, Settings, load_settings
 from database import (
@@ -32,6 +32,7 @@ from database import (
     search_indexes_ready,
     seed_dedupe_hashes,
     update_import_progress,
+    update_file_csv_metadata,
     insert_record_batch,
 )
 from logging_utils import configure_logging
@@ -39,6 +40,63 @@ from normalization import normalize_phone, normalize_text
 
 LOGGER = logging.getLogger("telegram_csv_search")
 CSV_SUFFIXES = {".csv", ".txt"}
+
+
+class _DecodedBinaryLines:
+    """Yield decoded physical lines while exposing exact positions in the byte file."""
+
+    def __init__(self, source: BinaryIO, encoding: str):
+        self.source = source
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        self.position = source.tell()
+        self.physical_lines = 0
+        self._finished = False
+
+    def __iter__(self) -> Iterator[str]:
+        return self
+
+    def __next__(self) -> str:
+        if self._finished:
+            raise StopIteration
+        raw_line = self.source.readline()
+        if raw_line:
+            self.position = self.source.tell()
+            self.physical_lines += 1
+            return self.decoder.decode(raw_line, final=False)
+        self._finished = True
+        tail = self.decoder.decode(b"", final=True)
+        if tail:
+            return tail
+        raise StopIteration
+
+
+class OffsetCsvReader:
+    """Read CSV records and report their exact half-open byte ranges."""
+
+    def __init__(self, source: BinaryIO, *, encoding: str, delimiter: str):
+        self.lines = _DecodedBinaryLines(source, encoding)
+        self.reader = csv.reader(self.lines, delimiter=delimiter)
+
+    def read_record(self) -> tuple[list[str], int, int, int] | None:
+        start_offset = self.lines.position
+        start_line = self.lines.physical_lines + 1
+        try:
+            fields = next(self.reader)
+        except StopIteration:
+            return None
+        return fields, start_offset, self.lines.position, start_line
+
+
+def read_csv_header(file_path: Path, settings: Settings) -> list[str]:
+    """Read the first CSV record as the upload's header row without loading the file."""
+    with file_path.open("rb") as source:
+        reader = OffsetCsvReader(
+            source, encoding=settings.csv_encoding, delimiter=settings.csv_delimiter
+        )
+        record = reader.read_record()
+    if record is None or not record[0] or not any(value.strip() for value in record[0]):
+        raise ValueError("The uploaded CSV is empty or its first row has no column names.")
+    return [value.strip() or f"column_{index + 1}" for index, value in enumerate(record[0])]
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -60,6 +118,11 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Stop at the first file error instead of continuing with later files.",
     )
+    parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Compact the SQLite database after import. Can be slow for very large databases.",
+    )
     return parser.parse_args()
 
 
@@ -75,8 +138,8 @@ def discover_files(data_directory: Path) -> list[Path]:
 
 def _field_map(raw_fields: list[str], column_names: tuple[str, ...]) -> dict[str, str]:
     values = {name: (raw_fields[index] if index < len(raw_fields) else "") for index, name in enumerate(column_names)}
-    # The canonical five fields are always available to the application. Alternative
-    # names remain represented losslessly in raw_fields_json.
+    # The canonical five fields are always available to the application. Every original
+    # value remains in the source CSV and is reconstructed from its byte range on search.
     return {
         "column_1": values.get("column_1", raw_fields[0] if len(raw_fields) > 0 else ""),
         "column_2": values.get("column_2", raw_fields[1] if len(raw_fields) > 1 else ""),
@@ -120,52 +183,66 @@ def _canonical_column_names(headers: list[str], settings: Settings) -> tuple[str
         "birth_date": {"birth_date", "birthdate", "date_of_birth", "تاریخ_تولد"},
         "phone": {"phone", "mobile", "telephone", "tel", "تلفن", "شماره"},
     }
-    result = list(settings.csv_column_names)
-    for canonical, names in aliases.items():
-        for index, header in enumerate(headers):
-            if _header_key(header) in names:
-                if index >= len(result):
-                    result.extend(f"column_{n}" for n in range(len(result) + 1, index + 2))
-                result[index] = canonical
-                break
+    result: list[str] = []
+    for index, header in enumerate(headers):
+        key = _header_key(header)
+        canonical_name = next(
+            (canonical for canonical, names in aliases.items() if key in names),
+            None,
+        )
+        if canonical_name is None and index < len(settings.csv_column_names):
+            configured_name = settings.csv_column_names[index]
+            if key == _header_key(configured_name):
+                canonical_name = configured_name
+        result.append(canonical_name or f"column_{index + 1}")
     return tuple(result)
 
 
 def make_database_row(
     file_id: int,
     source_line: int,
+    byte_offset_start: int,
+    byte_offset_end: int,
     raw_fields: list[str],
     settings: Settings,
     column_names: tuple[str, ...] | None = None,
+    selected_column_indices: tuple[int, ...] | list[int] | None = None,
 ) -> tuple:
-    """Convert one CSV row into database values while preserving original text."""
-    # csv.reader returns strings exactly as parsed, including literal "None". Strip no
-    # values: empty fields and whitespace are retained in raw_fields_json and display data.
-    fields = _field_map(raw_fields, column_names or settings.csv_column_names)
-    column_1_norm = normalize_text(fields["column_1"])
-    column_2_norm = normalize_text(fields["column_2"])
-    name_norm = normalize_text(fields["name"])
-    birth_date_norm = normalize_text(fields["birth_date"])
-    phone_norm = normalize_phone(fields["phone"], iran_mode=settings.phone_normalization)
+    """Build search keys from selected columns while retaining source byte offsets."""
+    names = column_names or settings.csv_column_names
+    selected = set(selected_column_indices if selected_column_indices is not None else range(len(raw_fields)))
+    # Canonical exact/prefix keys are populated only when their source column was selected.
+    def selected_value(canonical: str, fallback_index: int) -> str:
+        positions = [i for i, name in enumerate(names) if name == canonical and i in selected]
+        if not positions and fallback_index in selected and canonical not in names:
+            positions = [fallback_index]
+        return " ".join(raw_fields[i] for i in positions if i < len(raw_fields))
+
+    column_1_norm = normalize_text(selected_value("column_1", 0))
+    column_2_norm = normalize_text(selected_value("column_2", 1))
+    name_norm = normalize_text(selected_value("name", 2))
+    birth_date_norm = normalize_text(selected_value("birth_date", 3))
+    phone_norm = normalize_phone(selected_value("phone", 4), iran_mode=settings.phone_normalization)
     raw_json = json.dumps(raw_fields, ensure_ascii=False, separators=(",", ":"))
-    search_text_norm = normalize_text(" ".join(raw_fields))
-    record_hash = hashlib.blake2b(
-        raw_json.encode("utf-8"), digest_size=20
-    ).hexdigest()
+    selected_values = [raw_fields[i] for i in sorted(selected) if i < len(raw_fields)]
+    search_text_norm = normalize_text(" ".join(selected_values))
+    # Deduplicate only within the same source file and the same selection. A global
+    # raw-row hash could otherwise let an identical row in another upload suppress
+    # its separately selected/searchable columns.
+    dedupe_payload = json.dumps(
+        [file_id, sorted(selected), raw_fields], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    record_hash = hashlib.blake2b(dedupe_payload, digest_size=20).hexdigest()
     return (
         file_id,
         source_line,
-        fields["column_1"],
-        fields["column_2"],
-        fields["name"],
-        fields["birth_date"],
-        fields["phone"],
+        byte_offset_start,
+        byte_offset_end,
         column_1_norm,
         column_2_norm,
         name_norm,
         birth_date_norm,
         phone_norm,
-        raw_json,
         search_text_norm,
         record_hash,
     )
@@ -207,6 +284,7 @@ def import_one_file(
     *,
     telegram_metadata: dict[str, object] | None = None,
     progress_callback: Callable[[str], None] | None = None,
+    selected_column_indices: tuple[int, ...] | list[int] | None = None,
 ) -> tuple[int, int]:
     """Replace one source file atomically at file granularity, committing each batch."""
     relative_path = file_path.relative_to(settings.data_directory).as_posix()
@@ -214,7 +292,9 @@ def import_one_file(
     # Header metadata is determined after opening the source, then persisted on the file.
     file_id = mark_file_importing(connection, relative_path=relative_path,
         file_size=stat.st_size, modified_time_ns=stat.st_mtime_ns,
-        telegram_metadata=telegram_metadata)
+        telegram_metadata=telegram_metadata,
+        csv_encoding=settings.csv_encoding,
+        csv_delimiter=settings.csv_delimiter)
     # Removing old or partial rows first guarantees safe restart. Completed files are
     # never touched until the importer has decided that a changed/forced reimport is needed.
     removed = remove_records_for_source(connection, file_id)
@@ -228,23 +308,72 @@ def import_one_file(
     last_progress_at = start
     indexes_ready = search_indexes_ready(connection)
     try:
-        with file_path.open("r", encoding=settings.csv_encoding, newline="") as source:
-            reader = csv.reader(source, delimiter=settings.csv_delimiter)
-            first_row = next(reader, None)
-            if first_row is None:
+        with file_path.open("rb") as source:
+            reader = OffsetCsvReader(
+                source,
+                encoding=settings.csv_encoding,
+                delimiter=settings.csv_delimiter,
+            )
+            first_record = reader.read_record()
+            if first_record is None:
                 headers, has_header = list(settings.csv_column_names), settings.csv_has_header
-                remaining = iter(())
+                pending_record = None
             else:
-                headers, has_header = _header_names(first_row, settings)
-                remaining = reader if has_header else itertools.chain([first_row], reader)
+                first_row, first_start, first_end, first_line = first_record
+                if selected_column_indices is not None:
+                    # Telegram uploads pass explicit header selections; their first row
+                    # is authoritative even if global settings describe headerless files.
+                    headers, has_header = [value.strip() or f"column_{i + 1}" for i, value in enumerate(first_row)], True
+                else:
+                    headers, has_header = _header_names(first_row, settings)
+                pending_record = None if has_header else (
+                    first_row,
+                    first_start,
+                    first_end,
+                    first_line,
+                )
             canonical_names = _canonical_column_names(headers, settings)
-            connection.execute("UPDATE imported_files SET headers_json = ? WHERE id = ?",
-                               (json.dumps(headers, ensure_ascii=False), file_id))
-            connection.commit()
-            start_line = 2 if has_header else 1
-            for source_line, raw_fields in enumerate(remaining, start=start_line):
+            selected_indices = tuple(
+                selected_column_indices if selected_column_indices is not None else range(len(headers))
+            )
+            if any(index < 0 or index >= len(headers) for index in selected_indices):
+                raise ValueError("Selected CSV column index is outside the header range.")
+            if not selected_indices and rows_processed == 0 and first_record is not None:
+                raise ValueError("Select at least one CSV column to make the file searchable.")
+            update_file_csv_metadata(
+                connection,
+                file_id,
+                headers_json=json.dumps(headers, ensure_ascii=False),
+                column_names_json=json.dumps(canonical_names, ensure_ascii=False),
+                selected_columns_json=json.dumps(list(selected_indices)),
+                has_header=has_header,
+            )
+            last_source_line = 0
+            while True:
+                record = pending_record or reader.read_record()
+                pending_record = None
+                if record is None:
+                    break
+                raw_fields, byte_offset_start, byte_offset_end, source_line = record
+                if byte_offset_end <= byte_offset_start:
+                    raise ValueError(
+                        f"Invalid CSV byte range at line {source_line}: "
+                        f"{byte_offset_start}..{byte_offset_end}"
+                    )
                 rows_processed += 1
-                batch.append(make_database_row(file_id, source_line, raw_fields, settings, canonical_names))
+                last_source_line = source_line
+                batch.append(
+                    make_database_row(
+                        file_id,
+                        source_line,
+                        byte_offset_start,
+                        byte_offset_end,
+                        raw_fields,
+                        settings,
+                        canonical_names,
+                        selected_indices,
+                    )
+                )
                 if len(batch) >= settings.import_batch_size:
                     rows_inserted += insert_record_batch(
                         connection,
@@ -272,7 +401,7 @@ def import_one_file(
                 use_deduplication=settings.duplicate_mode == "exact",
                 update_fts=indexes_ready,
             )
-            update_import_progress(connection, file_id, rows_inserted, source_line if rows_processed else 0)
+            update_import_progress(connection, file_id, rows_inserted, last_source_line)
             connection.commit()
         mark_file_completed(connection, file_id, rows_inserted)
         message = _progress_message(
@@ -306,9 +435,11 @@ def main() -> int:
     except OSError as exc:
         LOGGER.error("Cannot discover CSV files: %s", exc)
         return 2
-    if not candidates:
+    if not candidates and not arguments.vacuum:
         LOGGER.warning("No .csv or .txt source files found in %s", settings.data_directory)
         return 0
+    if not candidates:
+        LOGGER.info("No CSV/TXT source files found; continuing with database maintenance.")
 
     imported_files = skipped_files = failed_files = imported_rows = 0
     connection = connect(settings.database_path)
@@ -343,6 +474,12 @@ def main() -> int:
         # on later incremental imports indexes stay current batch-by-batch.
         if imported_files or arguments.rebuild_indexes:
             build_search_indexes(connection, force=arguments.rebuild_indexes)
+        if arguments.vacuum:
+            # VACUUM rewrites the database and returns free pages to the OS.
+            # It is opt-in because it can take a long time on multi-GB databases.
+            LOGGER.info("Compacting SQLite database with VACUUM...")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("VACUUM")
         LOGGER.info(
             "Importer complete: imported_files=%d skipped_files=%d failed_files=%d inserted_records=%d database=%s",
             imported_files, skipped_files, failed_files, imported_rows, format_bytes(settings.database_path.stat().st_size),

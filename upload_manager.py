@@ -31,6 +31,7 @@ class UploadJob:
     uploader_id: int
     chat_id: int
     status_message_id: int | None = None
+    selected_column_indices: tuple[int, ...] | None = None
 
 
 class UploadManager:
@@ -152,6 +153,7 @@ class UploadManager:
                     connection, job.path, self.settings,
                     telegram_metadata=metadata,
                     progress_callback=progress,
+                    selected_column_indices=job.selected_column_indices,
                 )
                 build_search_indexes(connection)
                 return processed, inserted
@@ -166,15 +168,18 @@ class UploadManager:
             return
 
         if self.settings.delete_csv_after_import:
-            try:
-                job.path.unlink()
-            except OSError:
-                LOGGER.exception("Could not delete successfully imported upload path=%s", job.path)
-                await self._edit_status(job, f"⚠️ ایمپورت کامل شد ({inserted:,} رکورد)، اما حذف فایل ناموفق بود.")
-                return
-            await self._edit_status(job, f"✅ ایمپورت کامل شد\n{job.original_filename}\nرکوردهای درج‌شده: {inserted:,}\nفایل اصلی حذف شد.")
-        else:
-            await self._edit_status(job, f"✅ ایمپورت کامل شد\n{job.original_filename}\nرکوردهای خوانده‌شده: {processed:,}\nرکوردهای درج‌شده: {inserted:,}\nفایل اصلی نگه داشته شد.")
+            LOGGER.warning(
+                "DELETE_CSV_AFTER_IMPORT is ignored: source CSV is required for "
+                "offset-backed result hydration path=%s",
+                job.path,
+            )
+        await self._edit_status(
+            job,
+            f"✅ ایمپورت کامل شد\n{job.original_filename}\n"
+            f"رکوردهای خوانده‌شده: {processed:,}\n"
+            f"رکوردهای درج‌شده: {inserted:,}\n"
+            "فایل اصلی به‌عنوان منبع داده نگه داشته شد.",
+        )
 
 
 def _format_bytes(value: float) -> str:

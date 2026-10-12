@@ -107,7 +107,9 @@ class Settings:
             csv_column_names=tuple(item.strip() for item in os.getenv(
                 "CSV_COLUMN_NAMES", "column_1,column_2,name,birth_date,phone"
             ).split(",") if item.strip()),
-            duplicate_mode=os.getenv("DUPLICATE_MODE", "keep").strip().lower(),
+            # Telegram uploads receive unique temporary names. Exact deduplication
+            # prevents re-uploading the same CSV from multiplying the database.
+            duplicate_mode=os.getenv("DUPLICATE_MODE", "exact").strip().lower(),
             import_batch_size=_env_int("IMPORT_BATCH_SIZE", 5_000, minimum=100),
             import_progress_every_rows=_env_int("IMPORT_PROGRESS_EVERY_ROWS", 100_000, minimum=1_000),
             max_results=_env_int("MAX_RESULTS", 100, minimum=1),

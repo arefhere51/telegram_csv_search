@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import csv
+from dataclasses import dataclass, replace
 from html import escape
+import io
 import json
 import logging
 from pathlib import Path
@@ -29,15 +31,27 @@ from database import connect, database_statistics, initialize_database
 from logging_utils import configure_logging
 from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
+from import_csv import read_csv_header
 
 LOGGER = logging.getLogger("telegram_csv_search")
 SESSION_KEY = "search_sessions"
+UPLOAD_SELECTION_KEY = "pending_upload_selection"
 MAX_SESSIONS_PER_USER = 25
+UPLOAD_HEADER_PAGE_SIZE = 8
 
 
 @dataclass(frozen=True, slots=True)
 class QuerySession:
     query: str
+
+
+@dataclass(slots=True)
+class UploadSelectionSession:
+    token: str
+    job: UploadJob
+    headers: tuple[str, ...]
+    selected: set[int]
+    page: int = 0
 
 
 def authorized(update: Update, settings: Settings) -> bool:
@@ -81,7 +95,47 @@ def format_record(row: Any, index: int, settings: Settings) -> str:
     return "\n".join(lines)
 
 
-def format_page(query: str, page: int, result: SearchPage, settings: Settings) -> str:
+def page_needs_full_csv(result: SearchPage, settings: Settings) -> bool:
+    """Return true if the chat preview would shorten values or exceed Telegram limits."""
+    if len(format_page("", 0, result, settings)) > 3900:
+        return True
+    for row in result.rows:
+        raw_fields = parse_raw_fields(row)
+        source_budget = min(settings.max_field_display_chars, 315)
+        allocation = max(24, source_budget // max(len([value for value in raw_fields if value]) + 1, 1))
+        if any(len(value) > allocation for value in raw_fields if value):
+            return True
+    return False
+
+
+def full_results_csv_bytes(query: str, page: int, result: SearchPage) -> bytes:
+    """Serialize every original field on the current page for complete delivery."""
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["query", query, "page", page + 1])
+    for number, row in enumerate(result.rows, start=1):
+        try:
+            headers = json.loads(row["headers_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            headers = []
+        fields = parse_raw_fields(row)
+        if not headers:
+            headers = [f"column_{index + 1}" for index in range(len(fields))]
+        writer.writerow(["result", number, "source", row["source_file"], "line", row["source_line"]])
+        writer.writerow([str(value) for value in headers])
+        writer.writerow(fields)
+        writer.writerow([])
+    return output.getvalue().encode("utf-8-sig")
+
+
+def format_page(
+    query: str,
+    page: int,
+    result: SearchPage,
+    settings: Settings,
+    *,
+    full_csv_attached: bool = False,
+) -> str:
     visible_total = min(result.total_count, settings.max_results)
     start = page * settings.results_per_page + 1
     end = min(start + len(result.rows) - 1, visible_total)
@@ -90,6 +144,8 @@ def format_page(query: str, page: int, result: SearchPage, settings: Settings) -
         f"<b>Search:</b> {escape(truncate(query, settings.max_query_length))}\n"
         f"<b>Mode:</b> {mode_label}\n"
     )
+    if full_csv_attached:
+        header += "ℹ️ Some long values are shortened here; the attached CSV contains the full rows.\n"
     if result.total_count > settings.max_results:
         header += (
             f"<b>Found:</b> {result.total_count:,}; displaying the first "
@@ -179,12 +235,20 @@ async def respond_to_search(
         )
         return
     token = save_session(context, query)
+    needs_full_csv = page_needs_full_csv(result, settings)
     await update.effective_message.reply_text(
-        format_page(query, 0, result, settings),
+        format_page(query, 0, result, settings, full_csv_attached=needs_full_csv),
         parse_mode=ParseMode.HTML,
         reply_markup=pagination_keyboard(token, 0, result.total_count, settings),
         disable_web_page_preview=True,
     )
+    if needs_full_csv:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=io.BytesIO(full_results_csv_bytes(query, 0, result)),
+            filename="search_results_page_1.csv",
+            caption="Complete result rows with all original CSV columns.",
+        )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -192,8 +256,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if await deny_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Send a phone number, ID, name, birth date, or other searchable value. "
-        "Exact matches are checked first; identifier prefixes and Persian name prefixes are indexed.\n\n"
+        "Send a value to search in the columns selected for its CSV file. "
+        "When you upload a CSV, choose searchable columns from the inline buttons; matching results show the full source row.\n\n"
         "Commands: /search <query>, /stats, /help"
     )
 
@@ -203,9 +267,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if await deny_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Send a value directly or use /search. Exact phone numbers, IDs, and dates are fastest. "
-        "For partial identifiers, use at least the configured prefix length. Persian names are normalized "
-        "for Arabic/Persian ی and ک variants, zero-width characters, and extra spaces."
+        "Send a value directly or use /search. Uploads show an inline column picker; searches only inspect selected columns, while each match displays the whole row. "
+        "Persian text is normalized for Arabic/Persian ی and ک variants, zero-width characters, and extra spaces."
     )
 
 
@@ -249,29 +312,11 @@ async def download_file_with_progress(
     """
     if not file_path:
         raise RuntimeError("Telegram did not return a downloadable file path.")
+    url = f"{settings.telegram_file_base_url}/{settings.telegram_bot_token}/{file_path.lstrip('/')}"
     started = time.monotonic()
     last_update = 0.0
     received = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-
-    # Cloud Bot API may return a relative file path, while a Local Bot API
-    # Server can return either a complete URL or an absolute local path.
-    local_source = Path(file_path) if file_path.startswith("/") else None
-    if local_source is not None and local_source.is_file():
-        total = local_source.stat().st_size
-        with local_source.open("rb") as source, destination.open("wb") as output:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                received += len(chunk)
-        return
-
-    if file_path.startswith(("http://", "https://")):
-        url = file_path
-    else:
-        url = f"{settings.telegram_file_base_url}/{settings.telegram_bot_token}/{file_path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
@@ -302,6 +347,105 @@ async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if await deny_if_unauthorized(update, settings):
         return
     await respond_to_search(update, context, settings, update.effective_message.text or "")
+
+
+def upload_selection_keyboard(session: UploadSelectionSession) -> InlineKeyboardMarkup:
+    start = session.page * UPLOAD_HEADER_PAGE_SIZE
+    end = min(start + UPLOAD_HEADER_PAGE_SIZE, len(session.headers))
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(start, end):
+        checked = index in session.selected
+        label = truncate(session.headers[index], 42)
+        rows.append([InlineKeyboardButton(
+            f"{'☑' if checked else '☐'} {label}",
+            callback_data=f"u:{session.token}:t:{index}",
+        )])
+    navigation: list[InlineKeyboardButton] = []
+    if session.page > 0:
+        navigation.append(InlineKeyboardButton("← قبلی", callback_data=f"u:{session.token}:p:{session.page - 1}"))
+    if end < len(session.headers):
+        navigation.append(InlineKeyboardButton("بعدی →", callback_data=f"u:{session.token}:p:{session.page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([
+        InlineKeyboardButton("✅ تأیید انتخاب", callback_data=f"u:{session.token}:done"),
+        InlineKeyboardButton("لغو", callback_data=f"u:{session.token}:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def upload_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    callback = update.callback_query
+    if callback is None:
+        return
+    if not authorized(update, settings):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await callback.answer("این عملیات فقط در گفت‌وگوی خصوصی ربات مجاز است.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        await callback.answer("این انتخاب معتبر نیست.", show_alert=True)
+        return
+    sessions = context.user_data
+    session = sessions.get(UPLOAD_SELECTION_KEY)
+    if not isinstance(session, UploadSelectionSession) or session.token != parts[1]:
+        await callback.answer("مهلت انتخاب تمام شده؛ فایل را دوباره بفرستید.", show_alert=True)
+        return
+    action = parts[2]
+    if action == "t" and len(parts) == 4:
+        try:
+            index = int(parts[3])
+        except ValueError:
+            await callback.answer("ستون نامعتبر است.", show_alert=True)
+            return
+        if index < 0 or index >= len(session.headers):
+            await callback.answer("ستون نامعتبر است.", show_alert=True)
+            return
+        if index in session.selected:
+            session.selected.remove(index)
+        else:
+            session.selected.add(index)
+        await callback.answer()
+        await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
+        return
+    if action == "p" and len(parts) == 4:
+        try:
+            page = int(parts[3])
+        except ValueError:
+            page = -1
+        max_page = max((len(session.headers) - 1) // UPLOAD_HEADER_PAGE_SIZE, 0)
+        if page < 0 or page > max_page:
+            await callback.answer("صفحه نامعتبر است.", show_alert=True)
+            return
+        session.page = page
+        await callback.answer()
+        await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
+        return
+    if action == "cancel":
+        sessions.pop(UPLOAD_SELECTION_KEY, None)
+        session.job.path.unlink(missing_ok=True)
+        await callback.answer("فایل لغو شد.")
+        await callback.edit_message_text("آپلود و import لغو شد؛ فایل موقت حذف شد.")
+        return
+    if action == "done":
+        if not session.selected:
+            await callback.answer("حداقل یک ستون را برای جست‌وجو انتخاب کنید.", show_alert=True)
+            return
+        job = replace(session.job, selected_column_indices=tuple(sorted(session.selected)))
+        manager: UploadManager = context.application.bot_data["upload_manager"]
+        position = await manager.enqueue(job)
+        sessions.pop(UPLOAD_SELECTION_KEY, None)
+        await callback.answer("انتخاب ثبت شد.")
+        await callback.edit_message_text(
+            f"✅ ستون‌های انتخابی ثبت شدند\n{job.original_filename}\n"
+            f"📥 در صف import قرار گرفت؛ موقعیت: {position}\n"
+            "نتایج جست‌وجو فقط از ستون‌های انتخاب‌شده خواهند بود؛ کل ردیف نمایش داده می‌شود."
+        )
+        return
+    await callback.answer("عملیات ناشناخته است.", show_alert=True)
 
 
 async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,8 +496,18 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             LOGGER.exception("Could not remove incomplete upload path=%s", temporary_path)
         await status_message.edit_text("❌ دانلود ناموفق بود. فایل ناقص حذف شد و ایمپورتی شروع نشد.")
         return
-    manager: UploadManager = context.application.bot_data["upload_manager"]
-    position = await manager.enqueue(UploadJob(
+    try:
+        headers = await asyncio.to_thread(read_csv_header, final_path, settings)
+    except Exception as exc:
+        LOGGER.exception("Could not read CSV header user_id=%s filename=%s", update.effective_user.id, filename)
+        final_path.unlink(missing_ok=True)
+        await status_message.edit_text(f"❌ خواندن header فایل ناموفق بود: {exc}\nفایل حذف شد و import شروع نشد.")
+        return
+    if context.user_data.get(UPLOAD_SELECTION_KEY):
+        final_path.unlink(missing_ok=True)
+        await status_message.edit_text("❌ برای این حساب یک انتخاب ستون باز است. ابتدا آن را تأیید یا لغو کنید، سپس فایل بعدی را بفرستید.")
+        return
+    job = UploadJob(
         path=final_path,
         original_filename=filename,
         file_id=document.file_id,
@@ -362,8 +516,20 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         uploader_id=update.effective_user.id,
         chat_id=update.effective_chat.id,
         status_message_id=status_message.message_id,
-    ))
-    await status_message.edit_text(f"✅ دانلود کامل شد\n{filename}\n📥 در صف ایمپورت قرار گرفت؛ موقعیت: {position}")
+    )
+    selection = UploadSelectionSession(
+        token=secrets.token_urlsafe(6),
+        job=job,
+        headers=tuple(headers),
+        selected=set(),
+    )
+    context.user_data[UPLOAD_SELECTION_KEY] = selection
+    await status_message.edit_text(
+        f"✅ دانلود کامل شد\n{filename}\n"
+        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(headers)} ستون).\n"
+        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند.",
+        reply_markup=upload_selection_keyboard(selection),
+    )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -385,7 +551,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Failed files: {statistics['failed_files']:,}\n"
         f"Database size: {size_mib:,.1f} MiB\n"
         f"Last import: {escape(str(statistics['last_import']))}\n"
-        f"Searchable fields: 5 exact/prefix fields plus full-text name/row search\n"
+        f"Searchable fields: selected columns per source file\n"
         f"Search indexes ready: {'yes' if statistics['search_indexes_ready'] else 'no'}",
         parse_mode=ParseMode.HTML,
     )
@@ -418,12 +584,20 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not result.rows or page * settings.results_per_page >= visible_total:
         await callback.answer("No more results.", show_alert=True)
         return
+    needs_full_csv = page_needs_full_csv(result, settings)
     await callback.edit_message_text(
-        format_page(session.query, page, result, settings),
+        format_page(session.query, page, result, settings, full_csv_attached=needs_full_csv),
         parse_mode=ParseMode.HTML,
         reply_markup=pagination_keyboard(token, page, result.total_count, settings),
         disable_web_page_preview=True,
     )
+    if needs_full_csv:
+        await context.bot.send_document(
+            chat_id=callback.message.chat_id,
+            document=io.BytesIO(full_results_csv_bytes(session.query, page, result)),
+            filename=f"search_results_page_{page + 1}.csv",
+            caption="Complete result rows with all original CSV columns.",
+        )
 
 
 def main() -> None:
@@ -458,6 +632,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_upload))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
