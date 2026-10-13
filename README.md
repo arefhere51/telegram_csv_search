@@ -155,7 +155,7 @@ Allow authorized private-chat CSV uploads? [y]:
 
 ```text
 @my_username
-ID: 149772217
+ID: 123456789
 ```
 
 ### پاسخ پیشنهادی برای CSVهای معمولی
