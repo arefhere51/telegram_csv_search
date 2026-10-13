@@ -233,6 +233,8 @@ class ImportAndSearchTests(unittest.TestCase):
         aliases = get_header_aliases(self.connection)
         text = format_full_text_record(row, 1, aliases)
         preview = format_record(row, 1, self.settings, aliases)
+        self.assertTrue(text.startswith("━━━━━━━━━━━━━━━━━━"))
+        self.assertTrue(preview.startswith("━━━━━━━━━━━━━━━━━━"))
         self.assertIn("کد ملی: 57661928", text)
         self.assertIn("کد ملی:", preview)
         self.assertNotIn("NATIONAL_CODE", text)
@@ -249,11 +251,14 @@ class ImportAndSearchTests(unittest.TestCase):
         aliases = {"national_code": "کد ملی"}
         output_dir = self.data_directory / "exports"
         files = write_search_text_exports(
-            self.settings, "نام‌یافته", output_dir, aliases, page_size=4, max_chunk_bytes=350
+            self.settings, "نام‌یافته", output_dir, aliases, page_size=4,
+            max_chunk_bytes=350, filename_prefix="نتایج_نام‌یافته",
         )
         self.assertGreater(len(files), 1)
+        self.assertTrue(files[0].name.startswith("نتایج_نام"))
         contents = [path.read_text(encoding="utf-8") for path in files]
         joined = "".join(contents)
+        self.assertGreaterEqual(joined.count("━━━━━━━━━━━━━━━━━━"), 12)
         self.assertEqual(joined.count("منبع: many.csv:"), 12)
         self.assertEqual(joined.count("کد ملی:"), 12)
         self.assertIn("FULL_NAME: نام‌یافته 11", joined)

@@ -13,6 +13,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import tempfile
@@ -23,6 +24,7 @@ from urllib.parse import urlsplit
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -78,6 +80,7 @@ SEARCH_PREVIEW_LIMIT = 5
 SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
 DATABASE_MANAGEMENT_PAGE_SIZE = 8
+TEXT_SEND_TIMEOUT_SECONDS = 30
 
 
 class BotInstanceAlreadyRunning(RuntimeError):
@@ -216,7 +219,7 @@ def format_record(
     ]
     source_budget = min(settings.max_field_display_chars, 315)
     allocation = max(24, source_budget // max(len(values) + 1, 1))
-    lines = [f"<b>{index}.</b>"]
+    lines = ["━━━━━━━━━━━━━━━━━━"]
     for label, value in values:
         rendered = truncate(value, allocation) if value else "—"
         lines.append(f"<b>{escape(label)}:</b> {escape(rendered)}")
@@ -236,7 +239,7 @@ def format_full_text_record(
     if not headers:
         headers = [f"column_{i + 1}" for i in range(len(fields))]
     aliases = header_aliases or {}
-    lines: list[str] = []
+    lines: list[str] = ["━━━━━━━━━━━━━━━━━━"]
     for i in range(max(len(headers), len(fields))):
         original = str(headers[i]) if i < len(headers) else f"column_{i + 1}"
         label = aliases.get(header_alias_key(original), original)
@@ -275,6 +278,7 @@ def write_search_text_exports(
     *,
     page_size: int = SEARCH_EXPORT_PAGE_SIZE,
     max_chunk_bytes: int = SEARCH_EXPORT_CHUNK_BYTES,
+    filename_prefix: str = "نتایج_جست‌وجو",
 ) -> list[Path]:
     """Stream every match to bounded UTF-8 TXT chunks without truncating values."""
     if page_size < 1 or max_chunk_bytes < 4:
@@ -285,12 +289,15 @@ def write_search_text_exports(
     if total <= 0:
         return []
     destination.mkdir(parents=True, exist_ok=True)
+    filename_prefix = re.sub(r"[^\w-]+", "_", filename_prefix, flags=re.UNICODE).strip("_-")
+    filename_prefix = truncate(filename_prefix, 64) or "نتایج_جست‌وجو"
     paths: list[Path] = []
     written = 0
     handle = None
 
     def open_chunk(number: int):
-        path = destination / f"نتایج_جست‌وجو_{number:03d}.txt"
+        suffix = "" if number == 1 else f"_{number:03d}"
+        path = destination / f"{filename_prefix}{suffix}.txt"
         paths.append(path)
         return path.open("wb")
 
@@ -501,35 +508,79 @@ async def respond_to_search(
         await update.effective_message.reply_text("نتیجه‌ای پیدا نشد. عبارت دقیق‌تر یا کامل‌تری را امتحان کنید.")
         return
 
-    await update.effective_message.reply_text(
-        format_search_preview(query, result, settings, aliases),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    needs_txt = result.total_count > SEARCH_PREVIEW_LIMIT or page_needs_full_csv(result, settings)
-    if not needs_txt:
+    if result.total_count <= SEARCH_PREVIEW_LIMIT:
+        await update.effective_message.reply_text(
+            format_search_preview(query, result, settings, aliases),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         return
 
     status = await update.effective_message.reply_text(
-        f"در حال آماده‌سازی فایل متنیِ کامل برای {result.total_count:,} نتیجه…"
+        f"در حال آماده‌سازی فایل متنی برای {result.total_count:,} نتیجه…"
     )
     try:
         with tempfile.TemporaryDirectory(prefix="telegram-search-results-") as temp_dir:
+            safe_query = re.sub(r"[^\w-]+", "_", query, flags=re.UNICODE).strip("_-")
+            safe_query = truncate(safe_query, 48).strip("_-") or "جست‌وجو"
             paths = await asyncio.to_thread(
-                write_search_text_exports, settings, query, Path(temp_dir), aliases
+                write_search_text_exports,
+                settings,
+                query,
+                Path(temp_dir),
+                aliases,
+                filename_prefix=f"نتایج_{safe_query}",
             )
-            await status.edit_text(f"فایل کامل آماده شد؛ {result.total_count:,} نتیجه در {len(paths)} فایل متنی قرار گرفت.")
+            if not paths:
+                raise RuntimeError("Search returned a positive count but produced no text export files.")
             for part_number, path in enumerate(paths, start=1):
-                with path.open("rb") as document:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=document,
-                        filename=path.name,
-                        caption=f"بخش {part_number} از {len(paths)}؛ همه‌ی فیلدهای کامل ردیف‌های منطبق.",
+                try:
+                    await status.edit_text(
+                        f"در حال ارسال فایل متنی {part_number} از {len(paths)}؛ "
+                        "لطفاً تا ۳۰ ثانیه منتظر بمانید…"
                     )
+                except Exception:
+                    LOGGER.warning("Could not update text export status before sending part=%s", part_number)
+                with path.open("rb") as document:
+                    await asyncio.wait_for(
+                        context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=document,
+                            filename=path.name,
+                            caption=(
+                                f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}\n"
+                                f"بخش {part_number} از {len(paths)}؛ همهٔ فیلدهای کامل ردیف‌های منطبق."
+                            ),
+                            read_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                            write_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                            connect_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                            pool_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                        ),
+                        timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                    )
+                try:
+                    await status.edit_text(f"✅ فایل متنی {part_number} از {len(paths)} ارسال شد.")
+                except Exception:
+                    LOGGER.warning("Could not update text export status after sending part=%s", part_number)
+            try:
+                await status.edit_text("✅ ارسال همهٔ فایل‌های نتیجه کامل شد.")
+            except Exception:
+                LOGGER.warning("Could not update final text export status")
+    except (asyncio.TimeoutError, TimedOut):
+        LOGGER.warning(
+            "Text search result upload timed out after 30 seconds user_id=%s query_length=%d",
+            update.effective_user.id, len(query),
+        )
+        try:
+            await status.edit_text("ارسال فایل تا ۳۰ ثانیه کامل نشد؛ مشکلی در ارتباط پیش آمد. لطفاً کمی بعد دوباره تلاش کنید.")
+        except Exception:
+            LOGGER.warning("Could not update text export timeout status")
     except Exception:
         LOGGER.exception("Could not create/send full text search results user_id=%s", update.effective_user.id)
-        await status.edit_text("ساخت یا ارسال فایل کامل نتیجه‌ها ناموفق بود؛ لطفاً دوباره تلاش کنید.")
+        try:
+            await status.edit_text("ساخت یا ارسال فایل نتیجه‌ها با مشکل روبه‌رو شد؛ لطفاً کمی بعد دوباره تلاش کنید.")
+        except Exception:
+            LOGGER.warning("Could not update text export failure status")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -538,7 +589,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await update.effective_message.reply_text(
         "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
-        "در پیام حداکثر ۵ نتیجه می‌آید و اگر نتیجه‌های بیشتری باشد، فایل متنی کامل فرستاده می‌شود.\n\n"
+        "اگر حداکثر ۵ نتیجه پیدا شود، همه در پیام نشان داده می‌شوند؛ اگر بیش از ۵ نتیجه باشد، فقط فایل متنی فرستاده می‌شود.\n\n"
         "برای دریافت فایل از Drive، لینک اشتراک‌گذاری CSV را بفرستید؛ مدیر برای دیدن ایمیل دسترسی ربات /drive_setup را اجرا کند.\n"
         "دستورها: /search <عبارت>، /stats، /help، /admin"
     )
