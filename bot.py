@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import secrets
+import shutil
 import tempfile
 import time
 from typing import Any
@@ -46,12 +47,16 @@ from database import (
     add_bot_user,
     bot_user_exists,
     connect,
+    count_completed_files,
     database_statistics,
+    delete_imported_file,
     delete_header_alias,
+    get_imported_file_details,
     get_header_aliases,
     header_alias_key,
     initialize_access_control,
     initialize_database,
+    list_completed_files,
     list_bot_users,
     list_header_alias_entries,
     remove_bot_user,
@@ -72,6 +77,7 @@ UPLOAD_HEADER_PAGE_SIZE = 8
 SEARCH_PREVIEW_LIMIT = 5
 SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
+DATABASE_MANAGEMENT_PAGE_SIZE = 8
 
 
 class BotInstanceAlreadyRunning(RuntimeError):
@@ -544,7 +550,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "برای جست‌وجو یک مقدار بفرستید یا از /search استفاده کنید. هنگام بارگذاری CSV ستون‌های جست‌وجو را انتخاب می‌کنید؛ نتیجه همه‌ی فیلدهای ردیف را دارد. "
-        "برای دریافت CSV از Drive، لینک فایل را بفرستید. مدیر: /drive_setup، /admin، /user_add، /user_remove، /access، /header_set و /header_aliases."
+        "برای دریافت CSV از Drive، لینک فایل را بفرستید. مدیر: /drive_setup، /admin، /database، /user_add، /user_remove، /access، /header_set و /header_aliases."
     )
 
 
@@ -1084,6 +1090,7 @@ def _admin_panel_text(settings: Settings) -> str:
         "افزودن کاربر: /user_add 123456789\n"
         "حذف کاربر: /user_remove 123456789\n"
         "تغییر حالت: /access private یا /access public\n"
+        "مدیریت فایل‌ها و حذف ایندکس: /database\n"
         "تغییر نام هدر سراسری: /header_set NATIONAL_CODE = کد ملی\n"
         "دیدن نام‌های هدر: /header_aliases\n"
         "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n"
@@ -1102,6 +1109,241 @@ async def _deny_non_admin(update: Update, settings: Settings) -> bool:
             await update.effective_message.reply_text("فرمان‌های مدیریت را فقط در گفت‌وگوی خصوصی با ربات اجرا کنید.")
         return True
     return False
+
+
+def _database_file_display_name(row: Any) -> str:
+    original = row["telegram_filename"]
+    if original:
+        return str(original)
+    name = Path(str(row["relative_path"])).name
+    if name.startswith((".telegram-", ".drive-")):
+        parts = name.split("-", 2)
+        if len(parts) == 3:
+            name = parts[2]
+    return name
+
+
+def _database_list_view(settings: Settings, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        total = count_completed_files(connection)
+        total_pages = max(math.ceil(total / DATABASE_MANAGEMENT_PAGE_SIZE), 1)
+        page = min(max(int(page), 0), total_pages - 1)
+        files = list_completed_files(
+            connection,
+            limit=DATABASE_MANAGEMENT_PAGE_SIZE,
+            offset=page * DATABASE_MANAGEMENT_PAGE_SIZE,
+        )
+    finally:
+        connection.close()
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("← قبلی", callback_data=f"db:list:{page - 1}"))
+        if page + 1 < total_pages:
+            navigation.append(InlineKeyboardButton("بعدی →", callback_data=f"db:list:{page + 1}"))
+        rows.append(navigation)
+    for item in files:
+        label = truncate(_database_file_display_name(item), 38)
+        rows.append([InlineKeyboardButton(
+            f"📄 {label} · {int(item['record_count']):,}",
+            callback_data=f"db:file:{int(item['id'])}:{page}",
+        )])
+
+    text = (
+        "مدیریت فایل‌های پایگاه‌داده\n"
+        f"فایل‌های ایندکس‌شده: {total}\n"
+        f"صفحهٔ {page + 1} از {total_pages}\n"
+        "برای دیدن جزئیات یا حذف، روی نام فایل بزنید. حذف فقط پس از تأیید نهایی انجام می‌شود."
+    )
+    if total == 0:
+        text += "\nهنوز فایلی با وضعیت کامل در پایگاه‌داده وجود ندارد."
+    return text, InlineKeyboardMarkup(rows) if rows else None
+
+
+def _database_file_view(
+    settings: Settings, file_id: int, page: int
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        row = get_imported_file_details(connection, file_id)
+        details = dict(row) if row else None
+    finally:
+        connection.close()
+    if details is None:
+        return None
+    name = _database_file_display_name(details)
+    text = (
+        f"📄 فایل: {name}\n"
+        f"ردیف‌های ایندکس‌شده: {int(details['record_count']):,}\n"
+        f"حجم CSV خام: {_human_bytes(int(details['file_size']))}\n"
+        f"مسیر ثبت‌شده: {details['relative_path']}\n\n"
+        "برای خارج‌کردن این فایل از نتایج جست‌وجو، دکمهٔ حذف را بزنید."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 حذف از پایگاه‌داده", callback_data=f"db:confirm:{file_id}:{page}")],
+        [InlineKeyboardButton("↩️ بازگشت به فهرست", callback_data=f"db:list:{page}")],
+    ])
+    return text, keyboard
+
+
+def _archive_and_delete_database_file(settings: Settings, file_id: int):
+    """Remove the index and move its source CSV outside DATA_DIRECTORY, not delete it."""
+    connection = connect(settings.database_path)
+    source_path: Path | None = None
+    archived_path: Path | None = None
+    try:
+        row = get_imported_file_details(connection, file_id)
+        if row is None:
+            return None
+        if str(row["status"]) != "completed":
+            raise ValueError("Only completed imports can be removed from the database.")
+
+        data_root = settings.data_directory.resolve()
+        relative_path = Path(str(row["relative_path"]))
+        candidate = data_root / relative_path
+        if candidate.is_symlink():
+            raise ValueError("Refusing to archive a symbolic-link source file.")
+        source_path = candidate.resolve()
+        try:
+            source_path.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError("The source path is outside the configured data directory.") from exc
+
+        if source_path.is_file():
+            archive_root = data_root.parent / f"{data_root.name}_deleted_sources"
+            if archive_root.resolve().is_relative_to(data_root):
+                raise ValueError("The source archive must be outside the configured data directory.")
+            archived_path = archive_root / f"file_{int(file_id)}" / source_path.name
+            if archived_path.exists():
+                archived_path = archived_path.with_name(
+                    f"{archived_path.stem}_{secrets.token_hex(4)}{archived_path.suffix}"
+                )
+            archived_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(archived_path))
+
+        try:
+            result = delete_imported_file(connection, file_id)
+            if result is None:
+                raise RuntimeError("The imported file disappeared before deletion completed.")
+        except BaseException:
+            if archived_path and archived_path.exists() and source_path and not source_path.exists():
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(archived_path), str(source_path))
+            raise
+        return result, archived_path
+    finally:
+        connection.close()
+
+
+async def database_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    text, keyboard = _database_list_view(settings, 0)
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
+async def database_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    callback = update.callback_query
+    if callback is None:
+        return
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await callback.answer("این پنل فقط در گفت‌وگوی خصوصی کار می‌کند.", show_alert=True)
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None, settings):
+        await callback.answer("فقط مدیر مجاز است.", show_alert=True)
+        return
+
+    parts = (callback.data or "").split(":")
+    try:
+        if len(parts) == 3 and parts[1] == "list":
+            text, keyboard = _database_list_view(settings, int(parts[2]))
+            await callback.answer()
+            await callback.edit_message_text(text, reply_markup=keyboard)
+            return
+
+        if len(parts) == 4 and parts[1] in {"file", "confirm", "delete"}:
+            file_id, page = int(parts[2]), max(0, int(parts[3]))
+        else:
+            await callback.answer("درخواست نامعتبر است.", show_alert=True)
+            return
+    except ValueError:
+        await callback.answer("شناسهٔ فایل یا صفحه نامعتبر است.", show_alert=True)
+        return
+
+    action = parts[1]
+    if action == "file":
+        view = _database_file_view(settings, file_id, page)
+        if view is None:
+            await callback.answer("این فایل دیگر در پایگاه‌داده نیست.", show_alert=True)
+            text, keyboard = _database_list_view(settings, page)
+            await callback.edit_message_text(text, reply_markup=keyboard)
+            return
+        await callback.answer()
+        await callback.edit_message_text(view[0], reply_markup=view[1])
+        return
+
+    if action == "confirm":
+        view = _database_file_view(settings, file_id, page)
+        if view is None:
+            await callback.answer("این فایل دیگر در پایگاه‌داده نیست.", show_alert=True)
+            return
+        connection = connect(settings.database_path, readonly=True)
+        try:
+            row = get_imported_file_details(connection, file_id)
+            name = _database_file_display_name(row) if row else ""
+            record_count = int(row["record_count"]) if row else 0
+        finally:
+            connection.close()
+        archive_name = f"{settings.data_directory.name}_deleted_sources"
+        confirm_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأیید حذف از پایگاه‌داده", callback_data=f"db:delete:{file_id}:{page}")],
+            [InlineKeyboardButton("لغو", callback_data=f"db:file:{file_id}:{page}")],
+        ])
+        text = (
+            f"⚠️ تأیید حذف فایل\n{name}\n"
+            f"{record_count:,} ردیف از نتایج و پایگاه‌داده حذف می‌شود.\n"
+            f"CSV خام پاک نمی‌شود؛ به پوشهٔ {archive_name} بیرون از پوشهٔ داده منتقل می‌شود "
+            "تا بعداً ناخواسته دوباره ایندکس نشود.\n\nآیا ادامه می‌دهید؟"
+        )
+        await callback.answer()
+        await callback.edit_message_text(text, reply_markup=confirm_markup)
+        return
+
+    if action == "delete":
+        await callback.answer("در حال حذف از پایگاه‌داده و انتقال CSV خام به آرشیو…")
+        try:
+            result = await asyncio.to_thread(_archive_and_delete_database_file, settings, file_id)
+        except Exception:
+            LOGGER.exception("Failed to delete imported database file file_id=%s", file_id)
+            await callback.edit_message_text(
+                "❌ حذف انجام نشد. اطلاعات پایگاه‌داده دست‌نخورده مانده یا فایل خام به مسیر اصلی بازگردانده شده است.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("بازگشت به فهرست", callback_data=f"db:list:{page}")
+                ]]),
+            )
+            return
+        if result is None:
+            await callback.edit_message_text("این فایل دیگر در پایگاه‌داده نیست.")
+            return
+        deleted, archived_path = result
+        LOGGER.info(
+            "Deleted imported dataset file_id=%s rows=%s source_path=%s archive_path=%s",
+            file_id, deleted["record_count"], deleted["relative_path"], archived_path,
+        )
+        notice = (
+            f"✅ فایل از پایگاه‌داده حذف شد؛ {int(deleted['record_count']):,} ردیف دیگر در جست‌وجو نمی‌آید."
+        )
+        if archived_path:
+            notice += f"\nفایل خام در آرشیو نگه‌داری شد: {archived_path}"
+        else:
+            notice += "\nفایل خام پیدا نشد؛ فقط اطلاعات پایگاه‌داده حذف شد."
+        text, keyboard = _database_list_view(settings, page)
+        await callback.edit_message_text(f"{notice}\n\n{text}", reply_markup=keyboard)
 
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1387,6 +1629,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("database", database_management_command))
     application.add_handler(CommandHandler("admin", admin_panel_command))
     application.add_handler(CommandHandler("user_add", user_add_command))
     application.add_handler(CommandHandler("user_remove", user_remove_command))
@@ -1395,6 +1638,7 @@ def main() -> None:
     application.add_handler(CommandHandler("header_aliases", header_aliases_command))
     application.add_handler(CommandHandler("header_remove", header_remove_command))
     application.add_handler(CommandHandler("drive_setup", drive_setup_command))
+    application.add_handler(CallbackQueryHandler(database_management_callback, pattern=r"^db:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))

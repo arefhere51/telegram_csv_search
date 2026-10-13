@@ -257,9 +257,7 @@ def format_bytes(byte_count: int) -> str:
     return f"{byte_count} B"
 
 
-def _progress_message(
-    relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float
-) -> str:
+def _progress_metrics(file_size: int, file_handle, started: float) -> tuple[float, float]:
     elapsed = max(time.monotonic() - started, 0.001)
     # TextIOWrapper.tell() can raise after csv.reader has advanced via next().
     # The buffered binary stream still exposes a safe approximate byte position.
@@ -271,9 +269,28 @@ def _progress_message(
         except (AttributeError, OSError, ValueError):
             position = 0
     percent = min(position / file_size * 100, 100.0) if file_size else 100.0
+    return elapsed, percent
+
+
+def _progress_message(
+    relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float
+) -> str:
+    """Localized progress text shown to users in the Telegram chat."""
+    elapsed, percent = _progress_metrics(file_size, file_handle, started)
     return (
         f"فایل: {relative_path}؛ ردیف‌های خوانده‌شده: {processed:,}؛ ردیف‌های درج‌شده: {inserted:,}؛ "
         f"زمان: {elapsed:.1f} ثانیه؛ سرعت: {processed / elapsed:,.0f} ردیف/ثانیه؛ پیشرفت: {percent:.1f}%"
+    )
+
+
+def _progress_log_message(
+    relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float
+) -> str:
+    """English progress line written to the server log/console."""
+    elapsed, percent = _progress_metrics(file_size, file_handle, started)
+    return (
+        f"File: {relative_path}; rows_read: {processed:,}; rows_inserted: {inserted:,}; "
+        f"elapsed: {elapsed:.1f}s; speed: {processed / elapsed:,.0f} rows/s; progress: {percent:.1f}%"
     )
 
 
@@ -390,7 +407,9 @@ def import_one_file(
                     or now - last_progress_at >= 2.0
                 ):
                     message = _progress_message(relative_path, rows_processed, rows_inserted, stat.st_size, source, start)
-                    LOGGER.info(message)
+                    LOGGER.info(_progress_log_message(
+                        relative_path, rows_processed, rows_inserted, stat.st_size, source, start
+                    ))
                     if progress_callback:
                         progress_callback(message)
                     last_progress_at = now
@@ -410,7 +429,10 @@ def import_one_file(
                 type("Progress", (), {"tell": lambda _: stat.st_size})(),
                 start,
             )
-        LOGGER.info(message)
+        LOGGER.info(_progress_log_message(
+            relative_path, rows_processed, rows_inserted, stat.st_size,
+            type("Progress", (), {"tell": lambda _: stat.st_size})(), start,
+        ))
         if progress_callback:
             progress_callback(message)
         return rows_processed, rows_inserted

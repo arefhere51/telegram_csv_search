@@ -343,6 +343,89 @@ def get_imported_file(connection: sqlite3.Connection, relative_path: str) -> Imp
     return ImportedFile(**dict(row)) if row else None
 
 
+def count_completed_files(connection: sqlite3.Connection) -> int:
+    return int(connection.execute(
+        "SELECT COUNT(*) FROM imported_files WHERE status = 'completed'"
+    ).fetchone()[0])
+
+
+def list_completed_files(
+    connection: sqlite3.Connection, *, limit: int, offset: int
+) -> list[sqlite3.Row]:
+    return list(connection.execute(
+        """SELECT f.id, f.relative_path, f.file_size, f.status, f.rows_imported,
+                  f.completed_at, f.telegram_filename, COUNT(r.id) AS record_count
+           FROM imported_files f
+           LEFT JOIN records r ON r.source_file_id = f.id
+           WHERE f.status = 'completed'
+           GROUP BY f.id
+           ORDER BY COALESCE(f.completed_at, f.started_at) DESC, f.id DESC
+           LIMIT ? OFFSET ?""",
+        (max(1, int(limit)), max(0, int(offset))),
+    ).fetchall())
+
+
+def get_imported_file_details(
+    connection: sqlite3.Connection, file_id: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """SELECT f.id, f.relative_path, f.file_size, f.status, f.rows_imported,
+                  f.completed_at, f.telegram_filename, COUNT(r.id) AS record_count
+           FROM imported_files f
+           LEFT JOIN records r ON r.source_file_id = f.id
+           WHERE f.id = ?
+           GROUP BY f.id""",
+        (int(file_id),),
+    ).fetchone()
+
+
+def delete_imported_file(
+    connection: sqlite3.Connection, file_id: int
+) -> dict[str, object] | None:
+    """Remove one completed file, its records, FTS entries, and unused dedupe hashes."""
+    details = get_imported_file_details(connection, file_id)
+    if details is None:
+        return None
+    if str(details["status"]) != "completed":
+        raise ValueError("Only completed imports can be removed from the database.")
+
+    source_id = int(details["id"])
+    deleted_rows = int(details["record_count"])
+    with transaction(connection):
+        connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _deleted_file_hashes(record_hash TEXT PRIMARY KEY)"
+        )
+        connection.execute("DELETE FROM _deleted_file_hashes")
+        connection.execute(
+            "INSERT OR IGNORE INTO _deleted_file_hashes "
+            "SELECT DISTINCT record_hash FROM records WHERE source_file_id = ?",
+            (source_id,),
+        )
+        if deleted_rows and search_indexes_ready(connection):
+            connection.execute(
+                """INSERT INTO records_all_fts(records_all_fts, rowid, search_text_norm)
+                   SELECT 'delete', id, search_text_norm FROM records WHERE source_file_id = ?""",
+                (source_id,),
+            )
+        connection.execute("DELETE FROM records WHERE source_file_id = ?", (source_id,))
+        connection.execute("DELETE FROM imported_files WHERE id = ?", (source_id,))
+        connection.execute(
+            """DELETE FROM dedupe_hashes
+               WHERE record_hash IN (SELECT record_hash FROM _deleted_file_hashes)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM records r WHERE r.record_hash = dedupe_hashes.record_hash
+                 )"""
+        )
+
+    return {
+        "id": source_id,
+        "relative_path": str(details["relative_path"]),
+        "file_size": int(details["file_size"]),
+        "record_count": deleted_rows,
+        "telegram_filename": details["telegram_filename"],
+    }
+
+
 def file_needs_import(
     existing: ImportedFile | None,
     *,
