@@ -274,7 +274,12 @@ def search_records(
     mode: str | None = None,
     count_total: bool = True,
 ) -> SearchPage:
-    """Search exact values first, then indexed prefixes or FTS prefixes in selected columns."""
+    """Search identifiers exactly/prefix-wise and text by indexed token prefixes.
+
+    For text, the FTS prefix query intentionally includes both a cell that equals the
+    query and longer values beginning with that token. Returning an exact hit early
+    would hide rows such as ``علی امیری`` when the query is ``علی``.
+    """
     safe_query = query.strip()
     if not safe_query:
         return SearchPage((), 0, "empty")
@@ -298,11 +303,10 @@ def search_records(
             return SearchPage(rows, total, "text")
         raise ValueError(f"Unsupported search mode: {mode}")
 
-    exact = _exact_search(connection, safe_query, page, settings, count_total=count_total)
-    if exact.total_count or (mode is None and not count_total):
-        return exact
-
     if is_identifier_query(safe_query):
+        exact = _exact_search(connection, safe_query, page, settings, count_total=count_total)
+        if exact.total_count or not count_total:
+            return exact
         prefix_result = _identifier_prefix_search(
             connection, safe_query, page, settings, count_total=count_total
         )
@@ -312,12 +316,16 @@ def search_records(
     # FTS contains only the columns selected for this source file. Falling through also
     # lets numeric/custom-header columns participate after the canonical prefix indexes.
     fts_query = fts_prefix_query(normalize_text(safe_query))
-    if not fts_query:
-        return SearchPage((), 0, "text")
-    rows, total = _all_fields_rows_and_count(
-        connection, fts_query, page, settings, count_total=count_total
-    )
-    return SearchPage(rows, total, "text")
+    if fts_query:
+        rows, total = _all_fields_rows_and_count(
+            connection, fts_query, page, settings, count_total=count_total
+        )
+        if total or not count_total:
+            return SearchPage(rows, total, "text")
+
+    # FTS intentionally ignores one-character tokens and some punctuation-only
+    # inputs, so preserve a final exact lookup for those cases.
+    return _exact_search(connection, safe_query, page, settings, count_total=count_total)
 
 
 def parse_raw_fields(row: Mapping[str, Any] | sqlite3.Row) -> list[str]:

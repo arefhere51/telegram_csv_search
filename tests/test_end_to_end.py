@@ -109,6 +109,38 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertEqual(result.total_count, 1)
         self.assertEqual(result.rows[0]["column_1"], "66506301")
 
+    def test_text_search_includes_exact_name_and_longer_names_and_exports_all(self) -> None:
+        names = (
+            "علی",
+            "علی امیری",
+            "علی حسینی",
+            "علی محمدی",
+            "علی اکبری",
+            "علی رضایی",
+        )
+        source = self.data_directory / "ali-names.csv"
+        source.write_text(
+            "".join(f"{name},test-{index}\n" for index, name in enumerate(names)),
+            encoding="utf-8",
+            newline="",
+        )
+        import_one_file(self.connection, source, self.settings)
+        build_search_indexes(self.connection)
+
+        result = search_records(self.connection, "علی", 0, self.settings)
+        self.assertEqual(result.mode, "text")
+        self.assertEqual(result.total_count, len(names))
+        self.assertEqual({row["column_1"] for row in result.rows}, set(names))
+
+        export_settings = replace(self.settings, results_per_page=2)
+        export_dir = self.data_directory / "exports"
+        paths = write_search_text_exports(export_settings, "علی", export_dir)
+        self.assertTrue(paths)
+        exported = "".join(path.read_text(encoding="utf-8") for path in paths)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIn(f"column_1: {name}", exported)
+
     def test_identifier_prefix_search_uses_indexable_range_predicates(self) -> None:
         result = search_records(self.connection, "9359", 0, self.settings)
         self.assertEqual(result.mode, "prefix")
