@@ -40,16 +40,19 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ConfigurationError(f"{name} must be true or false.")
 
 
-def _parse_user_ids(raw: str) -> FrozenSet[int]:
+def _parse_user_ids(raw: str, setting_name: str = "ALLOWED_USER_IDS") -> FrozenSet[int]:
     result: set[int] = set()
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
         try:
-            result.add(int(item))
+            user_id = int(item)
         except ValueError as exc:
-            raise ConfigurationError("ALLOWED_USER_IDS must contain comma-separated integers.") from exc
+            raise ConfigurationError(f"{setting_name} must contain comma-separated integers.") from exc
+        if user_id <= 0:
+            raise ConfigurationError(f"{setting_name} must contain positive Telegram user IDs.")
+        result.add(user_id)
     return frozenset(result)
 
 
@@ -88,6 +91,8 @@ class Settings:
     delete_csv_after_import: bool
     telegram_base_url: str
     telegram_file_base_url: str
+    admin_user_ids: FrozenSet[int] = frozenset()
+    initial_access_mode: str = "private"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -95,9 +100,17 @@ class Settings:
         data_directory = _env_path(os.getenv("DATA_DIRECTORY", ""), PROJECT_ROOT / "data")
         database_path = _env_path(os.getenv("DATABASE_PATH", ""), PROJECT_ROOT / "database" / "search.db")
         log_directory = _env_path(os.getenv("LOG_DIRECTORY", ""), PROJECT_ROOT / "logs")
+        allowed_user_ids = _parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
+        configured_admins = os.getenv("ADMIN_USER_IDS", "").strip()
+        # Backward compatible safe default: the first bootstrap user is the sole admin.
+        if configured_admins:
+            admin_user_ids = _parse_user_ids(configured_admins, "ADMIN_USER_IDS")
+        else:
+            first_allowed = next((item.strip() for item in os.getenv("ALLOWED_USER_IDS", "").split(",") if item.strip()), "")
+            admin_user_ids = frozenset({int(first_allowed)}) if first_allowed else frozenset()
         settings = cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-            allowed_user_ids=_parse_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
+            allowed_user_ids=allowed_user_ids,
             data_directory=data_directory,
             database_path=database_path,
             log_directory=log_directory,
@@ -128,6 +141,8 @@ class Settings:
             # telegram-bot-api server and set both URLs to its reachable endpoints.
             telegram_base_url=os.getenv("TELEGRAM_BASE_URL", "https://api.telegram.org/bot").rstrip("/"),
             telegram_file_base_url=os.getenv("TELEGRAM_FILE_BASE_URL", "https://api.telegram.org/file/bot").rstrip("/"),
+            admin_user_ids=admin_user_ids,
+            initial_access_mode=os.getenv("ACCESS_MODE", "private").strip().lower(),
         )
         if settings.results_per_page > settings.max_results:
             raise ConfigurationError("RESULTS_PER_PAGE cannot exceed MAX_RESULTS.")
@@ -141,13 +156,15 @@ class Settings:
             raise ConfigurationError("UPLOAD_PROGRESS_INTERVAL_SECONDS must be greater than zero.")
         if not settings.telegram_base_url or not settings.telegram_file_base_url:
             raise ConfigurationError("Telegram API base URLs cannot be empty.")
+        if settings.initial_access_mode not in {"private", "public"}:
+            raise ConfigurationError("ACCESS_MODE must be private or public.")
         return settings
 
     def validate_for_bot(self) -> None:
         if not self.telegram_bot_token:
             raise ConfigurationError("TELEGRAM_BOT_TOKEN is required to run the bot.")
-        if not self.allowed_user_ids:
-            raise ConfigurationError("ALLOWED_USER_IDS is required. The bot deliberately refuses public access.")
+        if not self.admin_user_ids:
+            raise ConfigurationError("Set ADMIN_USER_IDS or include at least one initial owner in ALLOWED_USER_IDS.")
         if not self.database_path.exists():
             raise ConfigurationError("Database file does not exist. Run `python import_csv.py` before starting the bot.")
 

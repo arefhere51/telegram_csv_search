@@ -9,8 +9,10 @@ from html import escape
 import io
 import json
 import logging
+import math
 from pathlib import Path
 import secrets
+import tempfile
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,7 +30,23 @@ from telegram.ext import (
 )
 
 from config import ConfigurationError, Settings, load_settings
-from database import connect, database_statistics, initialize_database
+from database import (
+    access_mode as db_access_mode,
+    add_bot_user,
+    bot_user_exists,
+    connect,
+    database_statistics,
+    delete_header_alias,
+    get_header_aliases,
+    header_alias_key,
+    initialize_access_control,
+    initialize_database,
+    list_bot_users,
+    list_header_alias_entries,
+    remove_bot_user,
+    set_access_mode,
+    set_header_alias,
+)
 from logging_utils import configure_logging
 from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
@@ -39,6 +57,9 @@ SESSION_KEY = "search_sessions"
 UPLOAD_SELECTION_KEY = "pending_upload_selection"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
+SEARCH_PREVIEW_LIMIT = 5
+SEARCH_EXPORT_PAGE_SIZE = 1000
+SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,18 +76,70 @@ class UploadSelectionSession:
     page: int = 0
 
 
+def is_admin(user_id: int | None, settings: Settings) -> bool:
+    return user_id is not None and user_id in settings.admin_user_ids
+
+
+def access_state(settings: Settings) -> tuple[str, list[int]]:
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        return db_access_mode(connection), list_bot_users(connection)
+    finally:
+        connection.close()
+
+
 def authorized(update: Update, settings: Settings) -> bool:
     user = update.effective_user
-    return user is not None and user.id in settings.allowed_user_ids
+    if user is None:
+        return False
+    if is_admin(user.id, settings):
+        return True
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        if db_access_mode(connection) == "public":
+            return True
+        return bot_user_exists(connection, user.id)
+    except Exception:
+        LOGGER.exception("Could not verify bot access user_id=%s", user.id)
+        return False
+    finally:
+        connection.close()
+
+
+def upload_authorized(update: Update, settings: Settings) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if is_admin(user.id, settings):
+        return True
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        return bot_user_exists(connection, user.id)
+    finally:
+        connection.close()
+
+
+def load_display_header_aliases(settings: Settings) -> dict[str, str]:
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        return get_header_aliases(connection)
+    finally:
+        connection.close()
 
 
 async def deny_if_unauthorized(update: Update, settings: Settings) -> bool:
+    if not update.effective_chat or update.effective_chat.type != "private":
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "برای حفظ حریم خصوصی، ربات را فقط در گفت‌وگوی خصوصی استفاده کنید."
+            )
+        return True
     if authorized(update, settings):
         return False
     user_id = update.effective_user.id if update.effective_user else None
     LOGGER.warning("Denied bot access for Telegram user id=%s", user_id)
     if update.effective_message:
-        await update.effective_message.reply_text("Access denied.")
+        await update.effective_message.reply_text("دسترسی مجاز نیست.")
     return True
 
 
@@ -76,8 +149,13 @@ def truncate(value: str, limit: int) -> str:
     return value[: max(limit - 1, 1)].rstrip() + "…"
 
 
-def format_record(row: Any, index: int, settings: Settings) -> str:
-    """Render only non-empty values using the source file's real headers."""
+def format_record(
+    row: Any,
+    index: int,
+    settings: Settings,
+    header_aliases: dict[str, str] | None = None,
+) -> str:
+    """Render all fields using the source file's real headers."""
     try:
         headers = json.loads(row["headers_json"] or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -85,15 +163,148 @@ def format_record(row: Any, index: int, settings: Settings) -> str:
     raw_fields = parse_raw_fields(row)
     if not headers:
         headers = ["column_1", "column_2", "name", "birth_date", "phone"]
-    values = [(str(headers[i]) if i < len(headers) else f"Column {i + 1}", value)
-              for i, value in enumerate(raw_fields) if value]
+    field_count = max(len(headers), len(raw_fields))
+    values = [
+        (
+            (header_aliases or {}).get(
+                header_alias_key(str(headers[i]) if i < len(headers) else f"Column {i + 1}"),
+                str(headers[i]) if i < len(headers) else f"Column {i + 1}",
+            ),
+            raw_fields[i] if i < len(raw_fields) else "",
+        )
+        for i in range(field_count)
+    ]
     source_budget = min(settings.max_field_display_chars, 315)
     allocation = max(24, source_budget // max(len(values) + 1, 1))
     lines = [f"<b>{index}.</b>"]
     for label, value in values:
-        lines.append(f"<b>{escape(label)}:</b> {escape(truncate(value, allocation))}")
-    lines.append(f"<b>Source:</b> {escape(str(row['source_file']))}:{row['source_line']}")
+        rendered = truncate(value, allocation) if value else "—"
+        lines.append(f"<b>{escape(label)}:</b> {escape(rendered)}")
+    lines.append(f"<b>منبع:</b> {escape(str(row['source_file']))}:{row['source_line']}")
     return "\n".join(lines)
+
+
+def format_full_text_record(
+    row: Any, index: int, header_aliases: dict[str, str] | None = None
+) -> str:
+    """Render a complete, untruncated source record as plain UTF-8 text."""
+    try:
+        headers = json.loads(row["headers_json"] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        headers = []
+    fields = parse_raw_fields(row)
+    if not headers:
+        headers = [f"column_{i + 1}" for i in range(len(fields))]
+    aliases = header_aliases or {}
+    lines: list[str] = []
+    for i in range(max(len(headers), len(fields))):
+        original = str(headers[i]) if i < len(headers) else f"column_{i + 1}"
+        label = aliases.get(header_alias_key(original), original)
+        value = fields[i] if i < len(fields) else ""
+        lines.append(f"{label}: {value}" if value else f"{label}: —")
+    lines.append(f"منبع: {row['source_file']}:{row['source_line']}")
+    return "\n".join(lines) + "\n\n"
+
+
+def format_search_preview(
+    query: str,
+    result: SearchPage,
+    settings: Settings,
+    header_aliases: dict[str, str] | None = None,
+) -> str:
+    mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(result.mode, "جست‌وجو")
+    lines = [
+        f"<b>عبارت جست‌وجو:</b> {escape(truncate(query, settings.max_query_length))}",
+        f"<b>نوع جست‌وجو:</b> {mode_label}",
+        f"<b>تعداد کل نتیجه‌ها:</b> {result.total_count:,}",
+        "",
+    ]
+    rows = list(result.rows[:SEARCH_PREVIEW_LIMIT])
+    lines.extend(format_record(row, i + 1, settings, header_aliases) for i, row in enumerate(rows))
+    if result.total_count > SEARCH_PREVIEW_LIMIT:
+        lines.append("\n<b>نمایش پیام:</b> ۵ نتیجه‌ی اول؛ فایل متنی شامل همه‌ی نتیجه‌هاست.")
+    text = "\n\n".join(lines)
+    return text if len(text) <= 3900 else text[:3899].rsplit("\n", 1)[0] + "\n…"
+
+
+def write_search_text_exports(
+    settings: Settings,
+    query: str,
+    destination: Path,
+    header_aliases: dict[str, str] | None = None,
+    *,
+    page_size: int = SEARCH_EXPORT_PAGE_SIZE,
+    max_chunk_bytes: int = SEARCH_EXPORT_CHUNK_BYTES,
+) -> list[Path]:
+    """Stream every match to bounded UTF-8 TXT chunks without truncating values."""
+    if page_size < 1 or max_chunk_bytes < 4:
+        raise ValueError("page_size must be positive and max_chunk_bytes must be at least 4.")
+    export_settings = replace(settings, results_per_page=page_size)
+    first = run_search(export_settings, query, 0)
+    total = first.total_count
+    if total <= 0:
+        return []
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    written = 0
+    handle = None
+
+    def open_chunk(number: int):
+        path = destination / f"نتایج_جست‌وجو_{number:03d}.txt"
+        paths.append(path)
+        return path.open("wb")
+
+    def write_payload(payload: bytes) -> None:
+        nonlocal handle, written
+        while payload:
+            if handle is None:
+                handle = open_chunk(len(paths) + 1)
+                written = 0
+            room = max_chunk_bytes - written
+            cut = min(len(payload), room)
+            if cut < len(payload):
+                # Do not split a UTF-8 code point across two files.
+                while cut > 0 and (payload[cut] & 0xC0) == 0x80:
+                    cut -= 1
+                if cut == 0:
+                    if written:
+                        handle.close()
+                        handle = None
+                        continue
+                    raise ValueError("Could not find a UTF-8 boundary within the configured TXT chunk size.")
+            handle.write(payload[:cut])
+            payload = payload[cut:]
+            written += cut
+            if written >= max_chunk_bytes:
+                handle.close()
+                handle = None
+                written = 0
+
+    try:
+        for page in range(math.ceil(total / page_size)):
+            result = first if page == 0 else run_search(
+                export_settings, query, page, mode=first.mode, count_total=False
+            )
+            for offset, row in enumerate(result.rows):
+                record = format_full_text_record(
+                    row, page * page_size + offset + 1, header_aliases
+                ).encode("utf-8")
+                # Keep ordinary records intact within one part. Only a single row larger
+                # than the part limit is split, always at a UTF-8 boundary.
+                if handle is not None and written and (
+                    written + len(record) > max_chunk_bytes or len(record) > max_chunk_bytes
+                ):
+                    handle.close()
+                    handle = None
+                    written = 0
+                write_payload(record)
+        if not paths:
+            raise RuntimeError("Search count was positive but no rows were returned.")
+    finally:
+        if handle is not None:
+            handle.close()
+    return paths
+
 
 
 def page_needs_full_csv(result: SearchPage, settings: Settings) -> bool:
@@ -102,8 +313,13 @@ def page_needs_full_csv(result: SearchPage, settings: Settings) -> bool:
         return True
     for row in result.rows:
         raw_fields = parse_raw_fields(row)
+        try:
+            headers = json.loads(row["headers_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            headers = []
+        field_count = max(len(headers), len(raw_fields))
         source_budget = min(settings.max_field_display_chars, 315)
-        allocation = max(24, source_budget // max(len([value for value in raw_fields if value]) + 1, 1))
+        allocation = max(24, source_budget // max(field_count + 1, 1))
         if any(len(value) > allocation for value in raw_fields if value):
             return True
     return False
@@ -140,21 +356,20 @@ def format_page(
     visible_total = min(result.total_count, settings.max_results)
     start = page * settings.results_per_page + 1
     end = min(start + len(result.rows) - 1, visible_total)
-    mode_label = {"exact": "exact", "prefix": "prefix", "text": "text"}.get(result.mode, "search")
+    mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(result.mode, "جست‌وجو")
     header = (
-        f"<b>Search:</b> {escape(truncate(query, settings.max_query_length))}\n"
-        f"<b>Mode:</b> {mode_label}\n"
+        f"<b>جست‌وجو:</b> {escape(truncate(query, settings.max_query_length))}\n"
+        f"<b>حالت:</b> {mode_label}\n"
     )
     if full_csv_attached:
-        header += "ℹ️ Some long values are shortened here; the attached CSV contains the full rows.\n"
+        header += "ℹ️ بعضی مقدارهای بلند در پیش‌نمایش کوتاه شده‌اند؛ فایل متنی مقدار کامل را دارد.\n"
     if result.total_count > settings.max_results:
         header += (
-            f"<b>Found:</b> {result.total_count:,}; displaying the first "
-            f"{settings.max_results:,} results.\n"
+            f"<b>تعداد:</b> {result.total_count:,}؛ فقط بخشی از نتیجه‌ها نمایش داده می‌شوند.\n"
         )
     else:
-        header += f"<b>Found:</b> {result.total_count:,}\n"
-    header += f"<b>Showing:</b> {start:,}–{end:,}\n\n"
+        header += f"<b>تعداد:</b> {result.total_count:,}\n"
+    header += f"<b>نمایش:</b> {start:,} تا {end:,}\n\n"
     records = [
         format_record(row, start + offset, settings) for offset, row in enumerate(result.rows)
     ]
@@ -171,17 +386,28 @@ def pagination_keyboard(token: str, page: int, total_count: int, settings: Setti
     pages = (visible_total + settings.results_per_page - 1) // settings.results_per_page
     buttons: list[InlineKeyboardButton] = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("← Previous", callback_data=f"p:{token}:{page - 1}"))
+        buttons.append(InlineKeyboardButton("← قبلی", callback_data=f"p:{token}:{page - 1}"))
     if page + 1 < pages:
-        buttons.append(InlineKeyboardButton("Next →", callback_data=f"p:{token}:{page + 1}"))
+        buttons.append(InlineKeyboardButton("بعدی →", callback_data=f"p:{token}:{page + 1}"))
     return InlineKeyboardMarkup([buttons]) if buttons else None
 
 
-def run_search(settings: Settings, query: str, page: int) -> SearchPage:
+def run_search(
+    settings: Settings,
+    query: str,
+    page: int,
+    page_size: int | None = None,
+    *,
+    mode: str | None = None,
+    count_total: bool = True,
+) -> SearchPage:
     """Run a query in a worker thread with its own short-lived read-only connection."""
+    effective_settings = replace(settings, results_per_page=page_size) if page_size else settings
     connection = connect(settings.database_path, readonly=True)
     try:
-        return search_records(connection, query, page, settings)
+        return search_records(
+            connection, query, page, effective_settings, mode=mode, count_total=count_total
+        )
     finally:
         connection.close()
 
@@ -211,19 +437,20 @@ async def respond_to_search(
 ) -> None:
     query = raw_query.strip()
     if not query:
-        await update.effective_message.reply_text("Send a phone number, ID, name, date, or other searchable value.")
+        await update.effective_message.reply_text("یک شماره، شناسه، نام یا عبارت برای جست‌وجو بفرستید.")
         return
     if len(query) > settings.max_query_length:
         await update.effective_message.reply_text(
-            f"The query is too long. Send at most {settings.max_query_length} characters."
+            f"عبارت جست‌وجو بیش از حد طولانی است؛ حداکثر {settings.max_query_length} نویسه مجاز است."
         )
         return
     started = time.perf_counter()
     try:
-        result = await asyncio.to_thread(run_search, settings, query, 0)
+        result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
+        aliases = await asyncio.to_thread(load_display_header_aliases, settings)
     except Exception:
         LOGGER.exception("Search failed for user id=%s", update.effective_user.id)
-        await update.effective_message.reply_text("The search is temporarily unavailable. Please try again later.")
+        await update.effective_message.reply_text("جست‌وجو موقتاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.")
         return
     elapsed_ms = (time.perf_counter() - started) * 1000
     LOGGER.info(
@@ -231,25 +458,38 @@ async def respond_to_search(
         update.effective_user.id, len(query), result.mode, result.total_count, elapsed_ms,
     )
     if not result.total_count:
-        await update.effective_message.reply_text(
-            "No matching records were found. Try a complete identifier or a more specific name."
-        )
+        await update.effective_message.reply_text("نتیجه‌ای پیدا نشد. عبارت دقیق‌تر یا کامل‌تری را امتحان کنید.")
         return
-    token = save_session(context, query)
-    needs_full_csv = page_needs_full_csv(result, settings)
+
     await update.effective_message.reply_text(
-        format_page(query, 0, result, settings, full_csv_attached=needs_full_csv),
+        format_search_preview(query, result, settings, aliases),
         parse_mode=ParseMode.HTML,
-        reply_markup=pagination_keyboard(token, 0, result.total_count, settings),
         disable_web_page_preview=True,
     )
-    if needs_full_csv:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=io.BytesIO(full_results_csv_bytes(query, 0, result)),
-            filename="search_results_page_1.csv",
-            caption="Complete result rows with all original CSV columns.",
-        )
+    needs_txt = result.total_count > SEARCH_PREVIEW_LIMIT or page_needs_full_csv(result, settings)
+    if not needs_txt:
+        return
+
+    status = await update.effective_message.reply_text(
+        f"در حال آماده‌سازی فایل متنیِ کامل برای {result.total_count:,} نتیجه…"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="telegram-search-results-") as temp_dir:
+            paths = await asyncio.to_thread(
+                write_search_text_exports, settings, query, Path(temp_dir), aliases
+            )
+            await status.edit_text(f"فایل کامل آماده شد؛ {result.total_count:,} نتیجه در {len(paths)} فایل متنی قرار گرفت.")
+            for part_number, path in enumerate(paths, start=1):
+                with path.open("rb") as document:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=document,
+                        filename=path.name,
+                        caption=f"بخش {part_number} از {len(paths)}؛ همه‌ی فیلدهای کامل ردیف‌های منطبق.",
+                    )
+    except Exception:
+        LOGGER.exception("Could not create/send full text search results user_id=%s", update.effective_user.id)
+        await status.edit_text("ساخت یا ارسال فایل کامل نتیجه‌ها ناموفق بود؛ لطفاً دوباره تلاش کنید.")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -257,9 +497,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if await deny_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Send a value to search in the columns selected for its CSV file. "
-        "When you upload a CSV, choose searchable columns from the inline buttons; matching results show the full source row.\n\n"
-        "Commands: /search <query>, /stats, /help"
+        "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
+        "در پیام حداکثر ۵ نتیجه می‌آید و اگر نتیجه‌های بیشتری باشد، فایل متنی کامل فرستاده می‌شود.\n\n"
+        "دستورها: /search <عبارت>، /stats، /help، /admin"
     )
 
 
@@ -268,8 +508,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if await deny_if_unauthorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Send a value directly or use /search. Uploads show an inline column picker; searches only inspect selected columns, while each match displays the whole row. "
-        "Persian text is normalized for Arabic/Persian ی and ک variants, zero-width characters, and extra spaces."
+        "برای جست‌وجو یک مقدار بفرستید یا از /search استفاده کنید. هنگام بارگذاری CSV ستون‌های جست‌وجو را انتخاب می‌کنید؛ نتیجه همه‌ی فیلدهای ردیف را دارد. "
+        "مدیر: /admin، /user_add، /user_remove، /access، /header_set و /header_aliases."
     )
 
 
@@ -327,7 +567,39 @@ async def download_file_with_progress(
     both cloud and local Bot API deployments work.
     """
     if not file_path:
-        raise RuntimeError("Telegram did not return a downloadable file path.")
+        raise RuntimeError("تلگرام مسیر قابل دریافت فایل را برنگرداند.")
+    local_source = Path(file_path)
+    if local_source.is_absolute():
+        if not local_source.is_file():
+            raise FileNotFoundError(
+                "Local Bot API returned a filesystem path that is not visible to the bot process; "
+                "mount the Bot API data directory into the bot container."
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        total = total_bytes or local_source.stat().st_size
+        started = time.monotonic()
+        received = 0
+        last_update = 0.0
+        with local_source.open("rb") as source, destination.open("wb") as output:
+            while chunk := source.read(1024 * 1024):
+                output.write(chunk)
+                received += len(chunk)
+                now = time.monotonic()
+                if now - last_update >= settings.upload_progress_interval_seconds:
+                    elapsed = max(now - started, 0.001)
+                    percent = received / total * 100 if total else 0.0
+                    text = (
+                        f"⬇️ دریافت فایل\n{filename}\n"
+                        f"{_progress_bar(percent)} {percent:5.1f}%\n"
+                        f"حجم: {_human_bytes(received)} / {_human_bytes(total)}\n"
+                        f"سرعت: {_human_bytes(received / elapsed)} در ثانیه"
+                    )
+                    try:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                    except Exception:
+                        LOGGER.exception("Could not update local download progress filename=%s", filename)
+                    last_update = now
+        return
     url = telegram_file_download_url(settings, file_path)
     started = time.monotonic()
     last_update = 0.0
@@ -345,11 +617,11 @@ async def download_file_with_progress(
                         elapsed = max(now - started, 0.001)
                         percent = received / total_bytes * 100 if total_bytes else 0.0
                         text = (
-                            f"⬇️ دانلود فایل\n{filename}\n"
+                            f"⬇️ دریافت فایل\n{filename}\n"
                             f"{_progress_bar(percent)} {percent:5.1f}%\n"
                             f"حجم: {_human_bytes(received)}"
                             + (f" / {_human_bytes(total_bytes)}" if total_bytes else "")
-                            + f"\nسرعت: {_human_bytes(received / elapsed)}/s"
+                            + f"\nسرعت: {_human_bytes(received / elapsed)} در ثانیه"
                         )
                         try:
                             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
@@ -395,8 +667,8 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
     callback = update.callback_query
     if callback is None:
         return
-    if not authorized(update, settings):
-        await callback.answer("Access denied.", show_alert=True)
+    if not upload_authorized(update, settings):
+        await callback.answer("بارگذاری و مدیریت فایل فقط برای کاربران مجاز است.", show_alert=True)
         return
     if not update.effective_chat or update.effective_chat.type != "private":
         await callback.answer("این عملیات فقط در گفت‌وگوی خصوصی ربات مجاز است.", show_alert=True)
@@ -444,7 +716,7 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         session.job.path.unlink(missing_ok=True)
         await callback.answer("فایل لغو شد.")
-        await callback.edit_message_text("آپلود و import لغو شد؛ فایل موقت حذف شد.")
+        await callback.edit_message_text("بارگذاری و ورود اطلاعات لغو شد؛ فایل موقت حذف شد.")
         return
     if action == "done":
         if not session.selected:
@@ -457,8 +729,8 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         await callback.answer("انتخاب ثبت شد.")
         await callback.edit_message_text(
             f"✅ ستون‌های انتخابی ثبت شدند\n{job.original_filename}\n"
-            f"📥 در صف import قرار گرفت؛ موقعیت: {position}\n"
-            "نتایج جست‌وجو فقط از ستون‌های انتخاب‌شده خواهند بود؛ کل ردیف نمایش داده می‌شود."
+            f"📥 در صف ورود اطلاعات قرار گرفت؛ موقعیت: {position}\n"
+            "جست‌وجو فقط در ستون‌های انتخاب‌شده انجام می‌شود؛ همه‌ی فیلدهای ردیف نتیجه نمایش داده می‌شوند."
         )
         return
     await callback.answer("عملیات ناشناخته است.", show_alert=True)
@@ -470,27 +742,28 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message = update.effective_message
     if not message or not update.effective_chat or update.effective_chat.type != "private":
         return
-    if await deny_if_unauthorized(update, settings):
+    if not upload_authorized(update, settings):
+        await message.reply_text("بارگذاری فایل فقط برای مدیران و کاربران مجاز است.")
         return
     if not settings.upload_enabled:
-        await message.reply_text("File uploads are disabled by configuration.")
+        await message.reply_text("بارگذاری فایل با تنظیمات ربات غیرفعال شده است.")
         return
     document = message.document
     if not document:
         return
     filename = document.file_name or "upload.csv"
     if Path(filename).suffix.lower() not in {".csv", ".txt"}:
-        await message.reply_text("Only CSV or TXT documents are accepted.")
+        await message.reply_text("فقط فایل‌های CSV یا TXT پذیرفته می‌شوند.")
         return
     if document.file_size and document.file_size > settings.upload_max_bytes:
-        await message.reply_text(f"This file exceeds the configured upload limit of {settings.upload_max_bytes:,} bytes.")
+        await message.reply_text(f"حجم فایل از سقف تنظیم‌شده بیشتر است؛ سقف فعلی: {settings.upload_max_bytes:,} بایت است.")
         return
     # This path is inside DATA_DIRECTORY and remains hidden from discovery until the
     # download is complete and atomically renamed.
     settings.data_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = safe_upload_path(settings.data_directory, filename)
     final_path = temporary_path.with_suffix("")
-    status_message = await message.reply_text(f"📦 فایل دریافت شد\n{filename}\n⏳ آماده‌سازی دانلود...")
+    status_message = await message.reply_text(f"📦 فایل دریافت شد\n{filename}\n⏳ آماده‌سازی دریافت…")
     try:
         telegram_file = await context.bot.get_file(document.file_id)
         await download_file_with_progress(
@@ -503,8 +776,15 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             filename,
             document.file_size,
         )
+        actual_size = temporary_path.stat().st_size
+        if actual_size > settings.upload_max_bytes:
+            temporary_path.unlink(missing_ok=True)
+            await status_message.edit_text(
+                f"❌ حجم فایل ({actual_size:,} بایت) از سقف تنظیم‌شده ({settings.upload_max_bytes:,} بایت) بیشتر است؛ فایل حذف شد."
+            )
+            return
         temporary_path.replace(final_path)
-    except Exception:
+    except Exception as exc:
         # HTTP client exceptions include the request URL; never emit the bot token
         # through a traceback or exception string.
         detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
@@ -516,18 +796,20 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             temporary_path.unlink(missing_ok=True)
         except OSError:
             LOGGER.exception("Could not remove incomplete upload path=%s", temporary_path)
-        await status_message.edit_text("❌ دانلود ناموفق بود. فایل ناقص حذف شد و ایمپورتی شروع نشد.")
+        await status_message.edit_text("❌ دریافت فایل ناموفق بود. فایل ناقص حذف شد و ورود اطلاعات شروع نشد.")
         return
     try:
         headers = await asyncio.to_thread(read_csv_header, final_path, settings)
     except Exception as exc:
         LOGGER.exception("Could not read CSV header user_id=%s filename=%s", update.effective_user.id, filename)
         final_path.unlink(missing_ok=True)
-        await status_message.edit_text(f"❌ خواندن header فایل ناموفق بود: {exc}\nفایل حذف شد و import شروع نشد.")
+        await status_message.edit_text(
+            "❌ خواندن سرستون‌های فایل ناموفق بود؛ فایل حذف شد و ورود اطلاعات شروع نشد."
+        )
         return
     if context.user_data.get(UPLOAD_SELECTION_KEY):
         final_path.unlink(missing_ok=True)
-        await status_message.edit_text("❌ برای این حساب یک انتخاب ستون باز است. ابتدا آن را تأیید یا لغو کنید، سپس فایل بعدی را بفرستید.")
+        await status_message.edit_text("❌ برای این حساب انتخاب ستونی باز است. ابتدا آن را تأیید یا لغو کنید، سپس فایل بعدی را بفرستید.")
         return
     job = UploadJob(
         path=final_path,
@@ -547,10 +829,227 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     context.user_data[UPLOAD_SELECTION_KEY] = selection
     await status_message.edit_text(
-        f"✅ دانلود کامل شد\n{filename}\n"
+        f"✅ دریافت فایل کامل شد\n{filename}\n"
         f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(headers)} ستون).\n"
         "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند.",
         reply_markup=upload_selection_keyboard(selection),
+    )
+
+
+def _admin_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+    mode, users = access_state(settings)
+    mode_label = "🔓 عمومی‌کردن ربات" if mode == "private" else "🔒 خصوصی‌کردن ربات"
+    rows: list[list[InlineKeyboardButton]] = [[
+        InlineKeyboardButton(mode_label, callback_data=f"adm:mode:{'public' if mode == 'private' else 'private'}")
+    ]]
+    removable = [user_id for user_id in users if user_id not in settings.admin_user_ids]
+    for start in range(0, min(len(removable), 40), 2):
+        rows.append([
+            InlineKeyboardButton(f"حذف {user_id}", callback_data=f"adm:remove:{user_id}")
+            for user_id in removable[start:start + 2]
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_panel_text(settings: Settings) -> str:
+    mode, users = access_state(settings)
+    mode_text = "عمومی؛ جست‌وجو برای همه باز است" if mode == "public" else "خصوصی؛ فقط کاربران مجاز"
+    removable_count = sum(user_id not in settings.admin_user_ids for user_id in users)
+    return (
+        "پنل مدیریت\n"
+        f"وضعیت دسترسی: {mode_text}\n"
+        f"کاربران ثبت‌شده: {len(users)} (قابل حذف از دکمه‌ها: {min(removable_count, 40)})\n\n"
+        "افزودن کاربر: /user_add 123456789\n"
+        "حذف کاربر: /user_remove 123456789\n"
+        "تغییر حالت: /access private یا /access public\n"
+        "تغییر نام هدر سراسری: /header_set NATIONAL_CODE = کد ملی\n"
+        "دیدن نام‌های هدر: /header_aliases\n"
+        "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n\n"
+        "حالت عمومی فقط جست‌وجو را برای همه باز می‌کند؛ بارگذاری فایل همچنان فقط برای کاربران مجاز است."
+    )
+
+
+async def _deny_non_admin(update: Update, settings: Settings) -> bool:
+    if not is_admin(update.effective_user.id if update.effective_user else None, settings):
+        if update.effective_message:
+            await update.effective_message.reply_text("این دستور فقط برای مدیر ربات مجاز است.")
+        return True
+    if not update.effective_chat or update.effective_chat.type != "private":
+        if update.effective_message:
+            await update.effective_message.reply_text("فرمان‌های مدیریت را فقط در گفت‌وگوی خصوصی با ربات اجرا کنید.")
+        return True
+    return False
+
+
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    await update.effective_message.reply_text(
+        _admin_panel_text(settings), reply_markup=_admin_keyboard(settings)
+    )
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    callback = update.callback_query
+    if callback is None:
+        return
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await callback.answer("این پنل فقط در گفت‌وگوی خصوصی ربات کار می‌کند.", show_alert=True)
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None, settings):
+        await callback.answer("فقط مدیر مجاز است.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    action, value = parts[1], parts[2]
+    if action == "mode" and value in {"private", "public"}:
+        connection = connect(settings.database_path)
+        try:
+            set_access_mode(connection, value)
+        finally:
+            connection.close()
+        await callback.answer("حالت دسترسی تغییر کرد.")
+    elif action == "remove":
+        try:
+            user_id = int(value)
+        except ValueError:
+            await callback.answer("شناسه نامعتبر است.", show_alert=True)
+            return
+        if user_id in settings.admin_user_ids:
+            await callback.answer("دسترسی مدیر از این پنل حذف نمی‌شود.", show_alert=True)
+            return
+        connection = connect(settings.database_path)
+        try:
+            removed = remove_bot_user(connection, user_id)
+        finally:
+            connection.close()
+        await callback.answer("کاربر حذف شد." if removed else "این کاربر در فهرست نبود.")
+    else:
+        await callback.answer("عملیات ناشناخته است.", show_alert=True)
+        return
+    await callback.edit_message_text(
+        _admin_panel_text(settings), reply_markup=_admin_keyboard(settings)
+    )
+
+
+async def user_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit() or int(context.args[0]) <= 0:
+        await update.effective_message.reply_text("روش درست: /user_add 123456789")
+        return
+    user_id = int(context.args[0])
+    connection = connect(settings.database_path)
+    try:
+        added = add_bot_user(connection, user_id, update.effective_user.id)
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"شناسه {user_id} به کاربران مجاز اضافه شد." if added else f"شناسه {user_id} از قبل مجاز است."
+    )
+
+
+async def user_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit() or int(context.args[0]) <= 0:
+        await update.effective_message.reply_text("روش درست: /user_remove 123456789")
+        return
+    user_id = int(context.args[0])
+    if user_id in settings.admin_user_ids:
+        await update.effective_message.reply_text("شناسه‌ی مدیر اصلی از این فهرست حذف نمی‌شود.")
+        return
+    connection = connect(settings.database_path)
+    try:
+        removed = remove_bot_user(connection, user_id)
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"دسترسی شناسه {user_id} قطع شد." if removed else f"شناسه {user_id} در فهرست کاربران نبود."
+    )
+
+
+async def access_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    if len(context.args) != 1 or context.args[0].lower() not in {"private", "public"}:
+        await update.effective_message.reply_text("روش درست: /access private یا /access public")
+        return
+    mode = context.args[0].lower()
+    connection = connect(settings.database_path)
+    try:
+        set_access_mode(connection, mode)
+    finally:
+        connection.close()
+    response = (
+        "ربات اکنون عمومی است؛ همه می‌توانند جست‌وجو کنند، اما بارگذاری فقط برای کاربران مجاز است."
+        if mode == "public"
+        else "ربات اکنون خصوصی است؛ فقط مدیران و کاربران ثبت‌شده می‌توانند استفاده کنند."
+    )
+    await update.effective_message.reply_text(response)
+
+
+async def header_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    text = update.effective_message.text or ""
+    _, _, payload = text.partition(" ")
+    source, separator, display = payload.partition("=")
+    if not separator or not source.strip() or not display.strip():
+        await update.effective_message.reply_text("روش درست: /header_set NATIONAL_CODE = کد ملی")
+        return
+    connection = connect(settings.database_path)
+    try:
+        set_header_alias(connection, source.strip(), display.strip())
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"نام نمایشیِ «{source.strip()}» برای همه‌ی فایل‌ها به «{display.strip()}» تغییر کرد."
+    )
+
+
+async def header_aliases_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        entries = list_header_alias_entries(connection)
+    finally:
+        connection.close()
+    if not entries:
+        await update.effective_message.reply_text("هنوز نام نمایشی سفارشی برای هیچ هدر ثبت نشده است.")
+        return
+    lines = ["نام‌های نمایشی هدرها:"]
+    lines.extend(f"{source} → {display}" for source, display in entries)
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def header_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    text = update.effective_message.text or ""
+    _, _, source = text.partition(" ")
+    if not source.strip():
+        await update.effective_message.reply_text("روش درست: /header_remove NATIONAL_CODE")
+        return
+    connection = connect(settings.database_path)
+    try:
+        removed = delete_header_alias(connection, source.strip())
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"نام اصلی هدر «{source.strip()}» دوباره نمایش داده می‌شود."
+        if removed else "برای این هدر نام نمایشی سفارشی ثبت نشده بود."
     )
 
 
@@ -562,19 +1061,19 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         statistics = await asyncio.to_thread(run_stats, settings)
     except Exception:
         LOGGER.exception("Stats request failed for user id=%s", update.effective_user.id)
-        await update.effective_message.reply_text("Statistics are temporarily unavailable.")
+        await update.effective_message.reply_text("آمار موقتاً در دسترس نیست.")
         return
     size_mib = float(statistics["database_bytes"]) / (1024 * 1024)
     await update.effective_message.reply_text(
-        "<b>Database statistics</b>\n"
-        f"Total records: {statistics['records']:,}\n"
-        f"Imported files: {statistics['completed_files']:,}\n"
-        f"In progress: {statistics['importing_files']:,}\n"
-        f"Failed files: {statistics['failed_files']:,}\n"
-        f"Database size: {size_mib:,.1f} MiB\n"
-        f"Last import: {escape(str(statistics['last_import']))}\n"
-        f"Searchable fields: selected columns per source file\n"
-        f"Search indexes ready: {'yes' if statistics['search_indexes_ready'] else 'no'}",
+        "<b>آمار پایگاه داده</b>\n"
+        f"تعداد کل ردیف‌ها: {statistics['records']:,}\n"
+        f"فایل‌های کامل‌شده: {statistics['completed_files']:,}\n"
+        f"در حال پردازش: {statistics['importing_files']:,}\n"
+        f"فایل‌های ناموفق: {statistics['failed_files']:,}\n"
+        f"حجم پایگاه داده: {size_mib:,.1f} MiB\n"
+        f"آخرین ورود: {escape(str(statistics['last_import']))}\n"
+        f"ستون‌های جست‌وجو: ستون‌های انتخاب‌شده‌ی هر فایل\n"
+        f"شاخص‌های جست‌وجو آماده‌اند: {'بله' if statistics['search_indexes_ready'] else 'خیر'}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -585,7 +1084,7 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if callback is None:
         return
     if not authorized(update, settings):
-        await callback.answer("Access denied.", show_alert=True)
+        await callback.answer("دسترسی مجاز نیست.", show_alert=True)
         return
     try:
         _, token, page_value = (callback.data or "").split(":", 2)
@@ -593,18 +1092,18 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         sessions: dict[str, QuerySession] = context.user_data.get(SESSION_KEY, {})
         session = sessions[token]
     except (KeyError, ValueError):
-        await callback.answer("This result page has expired. Run the search again.", show_alert=True)
+        await callback.answer("این صفحه‌ی نتیجه منقضی شده است؛ دوباره جست‌وجو کنید.", show_alert=True)
         return
     await callback.answer()
     try:
         result = await asyncio.to_thread(run_search, settings, session.query, page)
     except Exception:
         LOGGER.exception("Pagination search failed for user id=%s", update.effective_user.id)
-        await callback.edit_message_text("The search is temporarily unavailable. Please run it again.")
+        await callback.edit_message_text("جست‌وجو موقتاً در دسترس نیست؛ دوباره تلاش کنید.")
         return
     visible_total = min(result.total_count, settings.max_results)
     if not result.rows or page * settings.results_per_page >= visible_total:
-        await callback.answer("No more results.", show_alert=True)
+        await callback.answer("نتیجه‌ی دیگری نیست.", show_alert=True)
         return
     needs_full_csv = page_needs_full_csv(result, settings)
     await callback.edit_message_text(
@@ -617,8 +1116,8 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await context.bot.send_document(
             chat_id=callback.message.chat_id,
             document=io.BytesIO(full_results_csv_bytes(session.query, page, result)),
-            filename=f"search_results_page_{page + 1}.csv",
-            caption="Complete result rows with all original CSV columns.",
+            filename=f"نتایج_جست‌وجو_{page + 1}.csv",
+            caption="همه‌ی فیلدهای اصلی ردیف‌های نتیجه.",
         )
 
 
@@ -631,6 +1130,7 @@ def main() -> None:
         connection = connect(settings.database_path)
         try:
             initialize_database(connection)
+            initialize_access_control(connection, settings)
         finally:
             connection.close()
         settings.validate_for_bot()
@@ -638,7 +1138,10 @@ def main() -> None:
         raise SystemExit(f"Configuration error: {exc}")
     global LOGGER
     LOGGER = configure_logging(settings.log_directory, "bot.log", settings.log_level)
-    LOGGER.info("Bot starting; allowed user count=%d", len(settings.allowed_user_ids))
+    LOGGER.info(
+        "Bot starting; bootstrap user count=%d admin count=%d",
+        len(settings.allowed_user_ids), len(settings.admin_user_ids),
+    )
 
     application = (
         Application.builder()
@@ -654,6 +1157,14 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("admin", admin_panel_command))
+    application.add_handler(CommandHandler("user_add", user_add_command))
+    application.add_handler(CommandHandler("user_remove", user_remove_command))
+    application.add_handler(CommandHandler("access", access_command))
+    application.add_handler(CommandHandler("header_set", header_set_command))
+    application.add_handler(CommandHandler("header_aliases", header_aliases_command))
+    application.add_handler(CommandHandler("header_remove", header_remove_command))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_upload))

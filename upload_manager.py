@@ -75,13 +75,13 @@ class UploadManager:
             progress = f"{self._bar(0)} --.-%"
             size = _format_bytes(received)
         return (
-            f"⬇️ دانلود فایل\n{filename}\n{progress}\n"
-            f"حجم: {size}\nسرعت: {_format_bytes(speed)}/s"
+            f"⬇️ دریافت فایل\n{filename}\n{progress}\n"
+            f"حجم: {size}\nسرعت: {_format_bytes(speed)} در ثانیه"
         )
 
     def _format_import(self, message: str) -> str:
         # import_csv emits a stable human-readable line with progress, rows and speed.
-        return f"📥 ایمپورت فایل\n{message}"
+        return f"📥 ورود اطلاعات فایل\n{message}"
 
     async def _edit_status(self, job: UploadJob, text: str) -> None:
         if not job.status_message_id:
@@ -114,12 +114,12 @@ class UploadManager:
                 raise
             except Exception:
                 LOGGER.exception("Unhandled upload worker error filename=%s", job.original_filename)
-                await self._status(job.chat_id, f"Import failed for {job.original_filename}. The CSV was kept on the server.")
+                await self._status(job.chat_id, f"ورود فایل {job.original_filename} ناموفق بود؛ فایل روی سرور نگه داشته شد.")
             finally:
                 self.queue.task_done()
 
     async def _process(self, job: UploadJob, position: int) -> None:
-        await self._edit_status(job, f"⏳ در صف ایمپورت\n{job.original_filename}\nموقعیت در صف: {position}")
+        await self._edit_status(job, f"⏳ در صف ورود اطلاعات\n{job.original_filename}\nموقعیت در صف: {position}")
         loop = asyncio.get_running_loop()
         last_status = 0.0
 
@@ -164,7 +164,11 @@ class UploadManager:
             processed, inserted = await asyncio.to_thread(import_sync)
         except Exception as exc:
             LOGGER.exception("Upload import failed filename=%s", job.original_filename)
-            await self._edit_status(job, f"❌ خطا در ایمپورت {job.original_filename}\n{type(exc).__name__}: {exc}\nفایل روی سرور نگه داشته شد.")
+            await self._edit_status(
+                job,
+                f"❌ ورود اطلاعات فایل {job.original_filename} ناموفق بود.\n"
+                "جزئیات فنی در گزارش سرور ثبت شد؛ فایل روی سرور نگه داشته شد.",
+            )
             return
 
         if self.settings.delete_csv_after_import:
@@ -175,7 +179,7 @@ class UploadManager:
             )
         await self._edit_status(
             job,
-            f"✅ ایمپورت کامل شد\n{job.original_filename}\n"
+            f"✅ ورود اطلاعات کامل شد\n{job.original_filename}\n"
             f"رکوردهای خوانده‌شده: {processed:,}\n"
             f"رکوردهای درج‌شده: {inserted:,}\n"
             "فایل اصلی به‌عنوان منبع داده نگه داشته شد.",

@@ -50,7 +50,7 @@ class HeaderAwareTests(unittest.TestCase):
                 self.assertNotIn("<b>birth_date:</b>", rendered)
                 hosein = search_records(connection, "حسین", 0, settings)
                 rendered_hosein = format_record(hosein.rows[0], 1, settings)
-                self.assertNotIn("<b>address:</b>", rendered_hosein)
+                self.assertIn("<b>address:</b> —", rendered_hosein)
             finally:
                 connection.close()
 

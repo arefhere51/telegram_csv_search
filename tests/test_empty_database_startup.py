@@ -48,7 +48,7 @@ class EmptyDatabaseStartupTests(unittest.TestCase):
                 raise OSError("telling position disabled by next() call")
 
         message = _progress_message("upload.csv", 10, 10, 1000, Handle(), 0.0)
-        self.assertIn("progress=12.3%", message)
+        self.assertIn("پیشرفت: 12.3%", message)
 
 
 if __name__ == "__main__":

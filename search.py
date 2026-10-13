@@ -151,6 +151,8 @@ def _rows_and_count(
     parameters: Sequence[object],
     page: int,
     settings: Settings,
+    *,
+    count_total: bool = True,
 ) -> tuple[Sequence[sqlite3.Row], int]:
     offset = page * settings.results_per_page
     base_sql = (
@@ -162,11 +164,21 @@ def _rows_and_count(
         base_sql + where_sql + " ORDER BY r.id LIMIT ? OFFSET ?",
         tuple(parameters) + (settings.results_per_page, offset),
     ).fetchall()
-    total_count = int(connection.execute(count_sql + where_sql, tuple(parameters)).fetchone()[0])
+    total_count = (
+        int(connection.execute(count_sql + where_sql, tuple(parameters)).fetchone()[0])
+        if count_total else 0
+    )
     return _hydrate_rows(rows, settings), total_count
 
 
-def _all_fields_rows_and_count(connection: sqlite3.Connection, fts_query: str, page: int, settings: Settings) -> tuple[Sequence[sqlite3.Row], int]:
+def _all_fields_rows_and_count(
+    connection: sqlite3.Connection,
+    fts_query: str,
+    page: int,
+    settings: Settings,
+    *,
+    count_total: bool = True,
+) -> tuple[Sequence[sqlite3.Row], int]:
     offset = page * settings.results_per_page
     base_sql = (
         f"SELECT {_HIT_COLUMNS} "
@@ -174,12 +186,15 @@ def _all_fields_rows_and_count(connection: sqlite3.Connection, fts_query: str, p
         "JOIN imported_files f ON f.id = r.source_file_id WHERE records_all_fts MATCH ? "
     )
     rows = connection.execute(base_sql + "ORDER BY records_all_fts.rank, r.id LIMIT ? OFFSET ?", (fts_query, settings.results_per_page, offset)).fetchall()
-    total = int(connection.execute("SELECT COUNT(*) FROM records_all_fts WHERE records_all_fts MATCH ?", (fts_query,)).fetchone()[0])
+    total = (
+        int(connection.execute("SELECT COUNT(*) FROM records_all_fts WHERE records_all_fts MATCH ?", (fts_query,)).fetchone()[0])
+        if count_total else 0
+    )
     return _hydrate_rows(rows, settings), total
 
 
 def _exact_search(
-    connection: sqlite3.Connection, query: str, page: int, settings: Settings
+    connection: sqlite3.Connection, query: str, page: int, settings: Settings, *, count_total: bool = True
 ) -> SearchPage:
     normalized = normalize_text(query)
     phone = normalize_phone(query, iran_mode=settings.phone_normalization)
@@ -203,6 +218,7 @@ def _exact_search(
         parameters,
         page,
         settings,
+        count_total=count_total,
     )
     return SearchPage(rows, total, "exact")
 
@@ -213,7 +229,7 @@ def _prefix_upper_bound(prefix: str) -> str:
 
 
 def _identifier_prefix_search(
-    connection: sqlite3.Connection, query: str, page: int, settings: Settings
+    connection: sqlite3.Connection, query: str, page: int, settings: Settings, *, count_total: bool = True
 ) -> SearchPage:
     prefix = normalize_phone(query, iran_mode=settings.phone_normalization)
     text_prefix = normalize_text(query)
@@ -244,12 +260,19 @@ def _identifier_prefix_search(
         tuple(phone_parameters) + (prefix, _prefix_upper_bound(prefix), prefix, _prefix_upper_bound(prefix), text_prefix, text_upper),
         page,
         settings,
+        count_total=count_total,
     )
     return SearchPage(rows, total, "prefix")
 
 
 def search_records(
-    connection: sqlite3.Connection, query: str, page: int, settings: Settings
+    connection: sqlite3.Connection,
+    query: str,
+    page: int,
+    settings: Settings,
+    *,
+    mode: str | None = None,
+    count_total: bool = True,
 ) -> SearchPage:
     """Search exact values first, then indexed prefixes or FTS prefixes in selected columns."""
     safe_query = query.strip()
@@ -260,12 +283,29 @@ def search_records(
     if page < 0:
         page = 0
 
-    exact = _exact_search(connection, safe_query, page, settings)
-    if exact.total_count:
+    if mode is not None:
+        if mode == "exact":
+            return _exact_search(connection, safe_query, page, settings, count_total=count_total)
+        if mode == "prefix":
+            return _identifier_prefix_search(connection, safe_query, page, settings, count_total=count_total)
+        if mode == "text":
+            fts_query = fts_prefix_query(normalize_text(safe_query))
+            if not fts_query:
+                return SearchPage((), 0, "text")
+            rows, total = _all_fields_rows_and_count(
+                connection, fts_query, page, settings, count_total=count_total
+            )
+            return SearchPage(rows, total, "text")
+        raise ValueError(f"Unsupported search mode: {mode}")
+
+    exact = _exact_search(connection, safe_query, page, settings, count_total=count_total)
+    if exact.total_count or (mode is None and not count_total):
         return exact
 
     if is_identifier_query(safe_query):
-        prefix_result = _identifier_prefix_search(connection, safe_query, page, settings)
+        prefix_result = _identifier_prefix_search(
+            connection, safe_query, page, settings, count_total=count_total
+        )
         if prefix_result.total_count:
             return prefix_result
 
@@ -274,7 +314,9 @@ def search_records(
     fts_query = fts_prefix_query(normalize_text(safe_query))
     if not fts_query:
         return SearchPage((), 0, "text")
-    rows, total = _all_fields_rows_and_count(connection, fts_query, page, settings)
+    rows, total = _all_fields_rows_and_count(
+        connection, fts_query, page, settings, count_total=count_total
+    )
     return SearchPage(rows, total, "text")
 
 

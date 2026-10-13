@@ -1,23 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
+from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 
 from config import Settings
 from database import (
     DatabaseRebuildRequired,
     SCHEMA_VERSION,
+    access_mode,
+    add_bot_user,
+    bot_user_exists,
     build_search_indexes,
     connect,
+    delete_header_alias,
+    get_header_aliases,
+    initialize_access_control,
     initialize_database,
+    list_bot_users,
+    remove_bot_user,
+    set_access_mode,
+    set_header_alias,
 )
 from import_csv import import_one_file
 from search import parse_raw_fields, search_records
 from upload_manager import safe_upload_path
-from bot import full_results_csv_bytes, page_needs_full_csv, telegram_file_download_url
+from bot import (
+    format_record,
+    format_full_text_record,
+    format_search_preview,
+    download_file_with_progress,
+    authorized,
+    upload_authorized,
+    deny_if_unauthorized,
+    full_results_csv_bytes,
+    page_needs_full_csv,
+    telegram_file_download_url,
+    write_search_text_exports,
+)
 
 
 class ImportAndSearchTests(unittest.TestCase):
@@ -141,6 +166,21 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["source_line"], 2)
         self.assertEqual(parse_raw_fields(result.rows[0])[3], "خط اول\r\nخط دوم، تهران")
 
+    def test_result_preview_includes_unselected_and_empty_columns(self) -> None:
+        row = {
+            "headers_json": '["id", "name", "phone", "address"]',
+            "raw_fields_json": '["42", "مریم", "09120000000", ""]',
+            "source_file": "people.csv",
+            "source_line": 2,
+        }
+        rendered = format_record(row, 1, self.settings)
+        self.assertIn("id:", rendered)
+        self.assertIn("name:", rendered)
+        self.assertIn("phone:", rendered)
+        self.assertIn("address:", rendered)
+        self.assertIn("09120000000", rendered)
+        self.assertIn("address:</b> —", rendered)
+
     def test_telegram_file_url_handles_relative_and_absolute_paths(self) -> None:
         relative = telegram_file_download_url(self.settings, "documents/file_7.csv")
         self.assertEqual(
@@ -149,6 +189,103 @@ class ImportAndSearchTests(unittest.TestCase):
         )
         absolute = "https://api.telegram.org/file/botunused-in-tests/documents/file_7.csv"
         self.assertEqual(telegram_file_download_url(self.settings, absolute), absolute)
+
+    def test_global_header_alias_renames_all_files_in_both_text_formats(self) -> None:
+        row = {
+            "headers_json": '["NATIONAL_CODE", "name"]',
+            "raw_fields_json": '["57661928", "مليحه خباز"]',
+            "source_file": "people.csv",
+            "source_line": 48879,
+        }
+        set_header_alias(self.connection, "NATIONAL_CODE", "کد ملی")
+        aliases = get_header_aliases(self.connection)
+        text = format_full_text_record(row, 1, aliases)
+        preview = format_record(row, 1, self.settings, aliases)
+        self.assertIn("کد ملی: 57661928", text)
+        self.assertIn("کد ملی:", preview)
+        self.assertNotIn("NATIONAL_CODE", text)
+        self.assertTrue(delete_header_alias(self.connection, "national_code"))
+        self.assertFalse(get_header_aliases(self.connection))
+
+    def test_txt_export_contains_all_matches_in_split_files(self) -> None:
+        source = self.data_directory / "many.csv"
+        rows = ["id,NATIONAL_CODE,FULL_NAME,PHONE\n"]
+        rows.extend(f"{i},57{i:06d},نام‌یافته {i},09{i:09d}\n" for i in range(12))
+        source.write_text("".join(rows), encoding="utf-8", newline="")
+        import_one_file(self.connection, source, self.settings, selected_column_indices=(0, 2))
+        build_search_indexes(self.connection)
+        aliases = {"national_code": "کد ملی"}
+        output_dir = self.data_directory / "exports"
+        files = write_search_text_exports(
+            self.settings, "نام‌یافته", output_dir, aliases, page_size=4, max_chunk_bytes=350
+        )
+        self.assertGreater(len(files), 1)
+        contents = [path.read_text(encoding="utf-8") for path in files]
+        joined = "".join(contents)
+        self.assertEqual(joined.count("منبع: many.csv:"), 12)
+        self.assertEqual(joined.count("کد ملی:"), 12)
+        self.assertIn("FULL_NAME: نام‌یافته 11", joined)
+        self.assertIn("PHONE: 09000000011", joined)
+        preview_result = search_records(self.connection, "نام‌یافته", 0, self.settings)
+        preview = format_search_preview("نام‌یافته", preview_result, self.settings, aliases)
+        self.assertIn("نام‌یافته 4", preview)
+        self.assertNotIn("نام‌یافته 5", preview)
+
+    def test_sensitive_search_commands_are_blocked_in_group_chats(self) -> None:
+        class FakeMessage:
+            text = None
+            async def reply_text(self, text):
+                self.text = text
+        message = FakeMessage()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(type="group"),
+            effective_message=message,
+            effective_user=SimpleNamespace(id=1),
+        )
+        blocked = asyncio.run(deny_if_unauthorized(update, self.settings))
+        self.assertTrue(blocked)
+        self.assertIn("گفت‌وگوی خصوصی", message.text)
+
+    def test_local_bot_api_absolute_path_is_copied_without_http(self) -> None:
+        source = self.data_directory / "local-api-file.csv"
+        source.write_bytes(b"a,b\n1,2\n")
+        destination = self.data_directory / "downloaded.csv.part"
+
+        class FakeBot:
+            async def edit_message_text(self, **kwargs):
+                return None
+
+        asyncio.run(download_file_with_progress(
+            self.settings,
+            str(source.resolve()),
+            destination,
+            FakeBot(),
+            1,
+            2,
+            source.name,
+            source.stat().st_size,
+        ))
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_persistent_access_mode_and_user_management(self) -> None:
+        settings = replace(self.settings, admin_user_ids=frozenset({1}))
+        initialize_access_control(self.connection, settings)
+        self.assertEqual(access_mode(self.connection), "private")
+        self.assertTrue(bot_user_exists(self.connection, 1))
+        self.assertTrue(add_bot_user(self.connection, 202020, 1))
+        self.assertIn(202020, list_bot_users(self.connection))
+        self.assertTrue(remove_bot_user(self.connection, 202020))
+        self.assertFalse(bot_user_exists(self.connection, 202020))
+        # Startup must not silently restore users that an admin removed.
+        initialize_access_control(self.connection, settings)
+        self.assertFalse(bot_user_exists(self.connection, 202020))
+        private_user = SimpleNamespace(effective_user=SimpleNamespace(id=303030))
+        self.assertFalse(authorized(private_user, settings))
+        set_access_mode(self.connection, "public")
+        self.assertEqual(access_mode(self.connection), "public")
+        self.assertTrue(authorized(private_user, settings))
+        self.assertFalse(upload_authorized(private_user, settings))
+        set_access_mode(self.connection, "private")
 
     def test_selected_columns_only_are_searchable_but_full_row_is_hydrated(self) -> None:
         source = self.data_directory / "selected.csv"
@@ -253,6 +390,26 @@ class LegacySchemaTests(unittest.TestCase):
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()[0]
             self.assertIn("selected_columns_json", columns)
+            self.assertEqual(version, SCHEMA_VERSION)
+        finally:
+            connection.close()
+
+    def test_schema_v3_migration_creates_access_and_header_alias_tables(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        try:
+            initialize_database(connection)
+            connection.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
+            connection.commit()
+            initialize_database(connection)
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            self.assertIn("bot_users", tables)
+            self.assertIn("header_aliases", tables)
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
             self.assertEqual(version, SCHEMA_VERSION)
         finally:
             connection.close()

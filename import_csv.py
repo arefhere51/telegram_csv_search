@@ -272,8 +272,8 @@ def _progress_message(
             position = 0
     percent = min(position / file_size * 100, 100.0) if file_size else 100.0
     return (
-        f"Processing {relative_path}: rows processed={processed:,}; rows inserted={inserted:,}; "
-        f"elapsed={elapsed:.1f}s; speed={processed / elapsed:,.0f} rows/s; progress={percent:.1f}%"
+        f"فایل: {relative_path}؛ ردیف‌های خوانده‌شده: {processed:,}؛ ردیف‌های درج‌شده: {inserted:,}؛ "
+        f"زمان: {elapsed:.1f} ثانیه؛ سرعت: {processed / elapsed:,.0f} ردیف/ثانیه؛ پیشرفت: {percent:.1f}%"
     )
 
 

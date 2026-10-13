@@ -10,7 +10,7 @@ from typing import Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 class DatabaseRebuildRequired(RuntimeError):
@@ -92,10 +92,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
             "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
         )
-    if stored_version not in {None, "2", SCHEMA_VERSION}:
+    if stored_version not in {None, "2", "3", SCHEMA_VERSION}:
         raise DatabaseRebuildRequired(
             f"Unsupported SQLite schema version {stored_version!r}; expected "
-            f"2 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+            f"2, 3 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
         )
     connection.executescript(
         """
@@ -150,6 +150,19 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         ) WITHOUT ROWID;
 
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY CHECK (user_id > 0),
+            added_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS header_aliases (
+            header_key TEXT PRIMARY KEY,
+            source_header TEXT NOT NULL,
+            display_header TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        ) WITHOUT ROWID;
+
         CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file_id);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS records_all_fts USING fts5(
@@ -201,6 +214,99 @@ def set_metadata(connection: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+def initialize_access_control(connection: sqlite3.Connection, settings: Settings) -> None:
+    """Seed private-mode users once; later changes made by admins remain persistent."""
+    mode = get_metadata(connection, "access_mode")
+    if mode not in {"private", "public"}:
+        set_metadata(connection, "access_mode", settings.initial_access_mode)
+    if get_metadata(connection, "access_bootstrap_done") != "1":
+        for user_id in sorted(settings.allowed_user_ids | settings.admin_user_ids):
+            connection.execute(
+                "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
+                (user_id, 0, utc_now()),
+            )
+        set_metadata(connection, "access_bootstrap_done", "1")
+    connection.commit()
+
+
+def access_mode(connection: sqlite3.Connection) -> str:
+    value = get_metadata(connection, "access_mode", "private")
+    return value if value in {"private", "public"} else "private"
+
+
+def set_access_mode(connection: sqlite3.Connection, mode: str) -> None:
+    if mode not in {"private", "public"}:
+        raise ValueError("Access mode must be private or public.")
+    set_metadata(connection, "access_mode", mode)
+    connection.commit()
+
+
+def list_bot_users(connection: sqlite3.Connection) -> list[int]:
+    return [int(row[0]) for row in connection.execute("SELECT user_id FROM bot_users ORDER BY user_id")]
+
+
+def bot_user_exists(connection: sqlite3.Connection, user_id: int) -> bool:
+    return connection.execute("SELECT 1 FROM bot_users WHERE user_id = ?", (int(user_id),)).fetchone() is not None
+
+
+def add_bot_user(connection: sqlite3.Connection, user_id: int, added_by: int) -> bool:
+    if int(user_id) <= 0:
+        raise ValueError("Telegram user ID must be positive.")
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
+        (int(user_id), int(added_by), utc_now()),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def remove_bot_user(connection: sqlite3.Connection, user_id: int) -> bool:
+    cursor = connection.execute("DELETE FROM bot_users WHERE user_id = ?", (int(user_id),))
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def header_alias_key(header: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKC", str(header)).strip().casefold()
+
+
+def get_header_aliases(connection: sqlite3.Connection) -> dict[str, str]:
+    return {str(row[0]): str(row[1]) for row in connection.execute(
+        "SELECT header_key, display_header FROM header_aliases ORDER BY header_key"
+    )}
+
+
+def list_header_alias_entries(connection: sqlite3.Connection) -> list[tuple[str, str]]:
+    return [
+        (str(row[0]), str(row[1]))
+        for row in connection.execute(
+            "SELECT source_header, display_header FROM header_aliases ORDER BY source_header COLLATE NOCASE"
+        )
+    ]
+
+
+def set_header_alias(connection: sqlite3.Connection, source_header: str, display_header: str) -> None:
+    key = header_alias_key(source_header)
+    source = str(source_header).strip()
+    display = str(display_header).strip()
+    if not key or not source or not display:
+        raise ValueError("Both source and display header names are required.")
+    connection.execute(
+        "INSERT INTO header_aliases(header_key, source_header, display_header, updated_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(header_key) DO UPDATE SET "
+        "source_header=excluded.source_header, display_header=excluded.display_header, updated_at=excluded.updated_at",
+        (key, source, display, utc_now()),
+    )
+    connection.commit()
+
+
+def delete_header_alias(connection: sqlite3.Connection, source_header: str) -> bool:
+    cursor = connection.execute("DELETE FROM header_aliases WHERE header_key = ?", (header_alias_key(source_header),))
+    connection.commit()
+    return cursor.rowcount > 0
 
 
 def search_indexes_ready(connection: sqlite3.Connection) -> bool:
