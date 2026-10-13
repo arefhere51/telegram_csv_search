@@ -12,6 +12,15 @@ if [[ ! -d "/" || ! -w "/" || "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 PROJECT_DIR="${PROJECT_DIR:-$DEFAULT_DIR}"
 
+# Resolve a relative target before changing directory. If the invoking shell is still
+# inside a directory removed by a previous install attempt, pwd fails; use / as the
+# relative-path base in that recovery case. Git must run from a valid working directory.
+if [[ "$PROJECT_DIR" != /* ]]; then
+  invoking_dir="$(pwd -P 2>/dev/null || printf '/')"
+  PROJECT_DIR="${invoking_dir%/}/$PROJECT_DIR"
+fi
+cd /
+
 printf '\nTelegram CSV Search - one-command installer\n'
 printf 'Repository: %s\nTarget:     %s\n\n' "$REPO_URL" "$PROJECT_DIR"
 

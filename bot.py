@@ -30,6 +30,15 @@ from telegram.ext import (
 )
 
 from config import ConfigurationError, Settings, load_settings
+from google_drive import (
+    DriveAccessDenied,
+    DriveDownloadError,
+    DriveFileTooLarge,
+    DriveInsufficientSpace,
+    DriveNotCsv,
+    download_drive_csv,
+    parse_drive_share_link,
+)
 from database import (
     access_mode as db_access_mode,
     add_bot_user,
@@ -55,6 +64,7 @@ from import_csv import read_csv_header
 LOGGER = logging.getLogger("telegram_csv_search")
 SESSION_KEY = "search_sessions"
 UPLOAD_SELECTION_KEY = "pending_upload_selection"
+UPLOAD_TRANSFER_KEY = "active_upload_transfer"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
 SEARCH_PREVIEW_LIMIT = 5
@@ -499,6 +509,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(
         "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
         "در پیام حداکثر ۵ نتیجه می‌آید و اگر نتیجه‌های بیشتری باشد، فایل متنی کامل فرستاده می‌شود.\n\n"
+        "برای دریافت فایل از Drive، لینک اشتراک‌گذاری CSV را بفرستید؛ مدیر برای دیدن ایمیل دسترسی ربات /drive_setup را اجرا کند.\n"
         "دستورها: /search <عبارت>، /stats، /help، /admin"
     )
 
@@ -509,7 +520,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "برای جست‌وجو یک مقدار بفرستید یا از /search استفاده کنید. هنگام بارگذاری CSV ستون‌های جست‌وجو را انتخاب می‌کنید؛ نتیجه همه‌ی فیلدهای ردیف را دارد. "
-        "مدیر: /admin، /user_add، /user_remove، /access، /header_set و /header_aliases."
+        "برای دریافت CSV از Drive، لینک فایل را بفرستید. مدیر: /drive_setup، /admin، /user_add، /user_remove، /access، /header_set و /header_aliases."
     )
 
 
@@ -736,6 +747,89 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
     await callback.answer("عملیات ناشناخته است.", show_alert=True)
 
 
+async def show_upload_header_selection(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    job: UploadJob,
+    status_message,
+) -> None:
+    """Read the first CSV row and show the same header picker for every source."""
+    try:
+        headers = await asyncio.to_thread(read_csv_header, job.path, settings)
+    except Exception:
+        LOGGER.exception("Could not read CSV header user_id=%s filename=%s", job.uploader_id, job.original_filename)
+        job.path.unlink(missing_ok=True)
+        await status_message.edit_text("❌ خواندن سرستون‌های فایل ناموفق بود؛ فایل حذف شد و ورود اطلاعات شروع نشد.")
+        return
+    if context.user_data.get(UPLOAD_SELECTION_KEY):
+        job.path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            "❌ برای این حساب انتخاب ستونی باز است. ابتدا آن را تأیید یا لغو کنید، سپس فایل بعدی را بفرستید."
+        )
+        return
+    selection = UploadSelectionSession(
+        token=secrets.token_urlsafe(6),
+        job=job,
+        headers=tuple(headers),
+        selected=set(),
+    )
+    context.user_data[UPLOAD_SELECTION_KEY] = selection
+    await status_message.edit_text(
+        f"✅ دریافت فایل کامل شد\n{job.original_filename}\n"
+        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(headers)} ستون).\n"
+        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند.",
+        reply_markup=upload_selection_keyboard(selection),
+    )
+
+
+async def _download_telegram_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    document,
+    filename: str,
+) -> None:
+    message = update.effective_message
+    settings.data_directory.mkdir(parents=True, exist_ok=True)
+    temporary_path = safe_upload_path(settings.data_directory, filename)
+    final_path = temporary_path.with_suffix("")
+    status_message = await message.reply_text(f"📦 فایل دریافت شد\n{filename}\n⏳ آماده‌سازی دریافت…")
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        await download_file_with_progress(
+            settings, telegram_file.file_path, temporary_path, context.bot,
+            status_message.chat_id, status_message.message_id, filename, document.file_size,
+        )
+        actual_size = temporary_path.stat().st_size
+        if actual_size > settings.upload_max_bytes:
+            temporary_path.unlink(missing_ok=True)
+            await status_message.edit_text(
+                f"❌ حجم فایل ({actual_size:,} بایت) از سقف تنظیم‌شده ({settings.upload_max_bytes:,} بایت) بیشتر است؛ فایل حذف شد."
+            )
+            return
+        temporary_path.replace(final_path)
+    except Exception as exc:
+        detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
+        LOGGER.error(
+            "Telegram download failed user_id=%s filename=%s error_type=%s detail=%s",
+            update.effective_user.id, filename, type(exc).__name__, detail,
+        )
+        temporary_path.unlink(missing_ok=True)
+        await status_message.edit_text("❌ دریافت فایل ناموفق بود. فایل ناقص حذف شد و ورود اطلاعات شروع نشد.")
+        return
+    job = UploadJob(
+        path=final_path,
+        original_filename=filename,
+        file_id=document.file_id,
+        file_unique_id=document.file_unique_id,
+        file_size=final_path.stat().st_size,
+        uploader_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+        status_message_id=status_message.message_id,
+    )
+    await show_upload_header_selection(context, settings, job, status_message)
+
+
 async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download an authorized private-chat CSV via the Bot API and queue its import."""
     settings: Settings = context.application.bot_data["settings"]
@@ -758,81 +852,170 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if document.file_size and document.file_size > settings.upload_max_bytes:
         await message.reply_text(f"حجم فایل از سقف تنظیم‌شده بیشتر است؛ سقف فعلی: {settings.upload_max_bytes:,} بایت است.")
         return
-    # This path is inside DATA_DIRECTORY and remains hidden from discovery until the
-    # download is complete and atomically renamed.
-    settings.data_directory.mkdir(parents=True, exist_ok=True)
-    temporary_path = safe_upload_path(settings.data_directory, filename)
-    final_path = temporary_path.with_suffix("")
-    status_message = await message.reply_text(f"📦 فایل دریافت شد\n{filename}\n⏳ آماده‌سازی دریافت…")
+    if context.user_data.get(UPLOAD_TRANSFER_KEY) or context.user_data.get(UPLOAD_SELECTION_KEY):
+        await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
+        return
+    context.user_data[UPLOAD_TRANSFER_KEY] = "telegram"
     try:
-        telegram_file = await context.bot.get_file(document.file_id)
-        await download_file_with_progress(
-            settings,
-            telegram_file.file_path,
-            temporary_path,
-            context.bot,
-            status_message.chat_id,
-            status_message.message_id,
-            filename,
-            document.file_size,
-        )
-        actual_size = temporary_path.stat().st_size
-        if actual_size > settings.upload_max_bytes:
-            temporary_path.unlink(missing_ok=True)
-            await status_message.edit_text(
-                f"❌ حجم فایل ({actual_size:,} بایت) از سقف تنظیم‌شده ({settings.upload_max_bytes:,} بایت) بیشتر است؛ فایل حذف شد."
-            )
+        await _download_telegram_document(update, context, settings, document, filename)
+    finally:
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+
+
+def _drive_progress_text(filename: str, received: int, total: int | None, elapsed: float) -> str:
+    if total:
+        percent = received / total * 100
+        size = f"{_human_bytes(received)} / {_human_bytes(total)}"
+    else:
+        percent = 0.0
+        size = _human_bytes(received)
+    return (
+        f"🔗 دریافت از Google Drive\n{filename}\n"
+        f"{_progress_bar(percent)} {percent:5.1f}%\n"
+        f"حجم: {size}\nسرعت: {_human_bytes(received / max(elapsed, 0.001))} در ثانیه"
+    )
+
+
+async def _download_drive_upload(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    reference,
+    temporary_path: Path,
+    status_message,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = time.monotonic()
+    last_update = 0.0
+    progress_queue: asyncio.Queue[tuple[str, int, int | None] | None] = asyncio.Queue()
+
+    async def consume_progress() -> None:
+        while True:
+            item = await progress_queue.get()
+            if item is None:
+                return
+            filename, received, total = item
+            text = _drive_progress_text(filename, received, total, time.monotonic() - started)
+            try:
+                await status_message.edit_text(text)
+            except Exception:
+                LOGGER.debug("Could not refresh Drive download progress user_id=%s", update.effective_user.id)
+
+    progress_task = asyncio.create_task(consume_progress(), name="google-drive-progress-updates")
+
+    def progress(filename: str, received: int, total: int | None) -> None:
+        nonlocal last_update
+        now = time.monotonic()
+        if received and now - last_update < settings.upload_progress_interval_seconds:
             return
-        temporary_path.replace(final_path)
-    except Exception as exc:
-        # HTTP client exceptions include the request URL; never emit the bot token
-        # through a traceback or exception string.
-        detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
-        LOGGER.error(
-            "Telegram download failed user_id=%s filename=%s error_type=%s detail=%s",
-            update.effective_user.id, filename, type(exc).__name__, detail,
-        )
+        last_update = now
+        loop.call_soon_threadsafe(progress_queue.put_nowait, (filename, received, total))
+
+    try:
         try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.exception("Could not remove incomplete upload path=%s", temporary_path)
-        await status_message.edit_text("❌ دریافت فایل ناموفق بود. فایل ناقص حذف شد و ورود اطلاعات شروع نشد.")
+            info = await asyncio.to_thread(
+                download_drive_csv,
+                settings,
+                reference,
+                temporary_path,
+                max_bytes=settings.upload_max_bytes,
+                progress_callback=progress,
+            )
+        finally:
+            await progress_queue.put(None)
+            await progress_task
+        actual_size = temporary_path.stat().st_size
+        final_path = safe_upload_path(
+            settings.data_directory, info.name, source_prefix="drive"
+        ).with_suffix("")
+        temporary_path.replace(final_path)
+        job = UploadJob(
+            path=final_path,
+            original_filename=info.name,
+            file_id=f"drive:{info.file_id}",
+            file_unique_id=None,
+            file_size=actual_size,
+            uploader_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            status_message_id=status_message.message_id,
+            source_kind="google_drive",
+        )
+        await show_upload_header_selection(context, settings, job, status_message)
+    except DriveAccessDenied as exc:
+        temporary_path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            "به فایل دسترسی ندارم. در Google Drive، بخش اشتراک‌گذاری را روی «هرکسی که لینک را دارد — مشاهده‌گر» بگذارید و لینک جدید را بفرستید. "
+            "فایل خصوصی با روش فعلی قابل دریافت نیست."
+        )
+    except DriveFileTooLarge as exc:
+        temporary_path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            f"حجم فایل ({_human_bytes(exc.actual)}) از سقف تنظیم‌شده ({_human_bytes(exc.maximum)}) بیشتر است."
+        )
+    except DriveInsufficientSpace as exc:
+        temporary_path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            f"فضای آزاد دیسک برای دریافت فایل کافی نیست؛ فایل {_human_bytes(exc.required)} و فضای آزاد {_human_bytes(exc.available)} است."
+        )
+    except DriveNotCsv:
+        temporary_path.unlink(missing_ok=True)
+        await status_message.edit_text("این لینک به فایل CSV یا TXT نمی‌رسد. فایل‌های Google Sheets/Docs را ابتدا به CSV تبدیل کنید.")
+    except DriveDownloadError:
+        temporary_path.unlink(missing_ok=True)
+        LOGGER.warning("Google Drive download failed user_id=%s", update.effective_user.id)
+        await status_message.edit_text("دریافت فایل از Google Drive ناموفق بود؛ دسترسی، لینک و اتصال اینترنت را بررسی کنید.")
+    except Exception as exc:
+        temporary_path.unlink(missing_ok=True)
+        LOGGER.error("Unexpected Google Drive download error user_id=%s error_type=%s", update.effective_user.id, type(exc).__name__)
+        await status_message.edit_text("دریافت فایل از Google Drive ناموفق بود؛ فایل ناقص حذف شد و ورود اطلاعات آغاز نشد.")
+    finally:
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+
+
+async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Accept a Google Drive file-sharing link in a private Telegram chat."""
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if not message or not update.effective_chat or update.effective_chat.type != "private":
+        return
+    if not upload_authorized(update, settings):
+        await message.reply_text("دریافت فایل فقط برای مدیران و کاربران مجاز است.")
+        return
+    if not settings.upload_enabled:
+        await message.reply_text("بارگذاری فایل با تنظیمات ربات غیرفعال شده است.")
+        return
+    if context.user_data.get(UPLOAD_TRANSFER_KEY) or context.user_data.get(UPLOAD_SELECTION_KEY):
+        await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
         return
     try:
-        headers = await asyncio.to_thread(read_csv_header, final_path, settings)
-    except Exception as exc:
-        LOGGER.exception("Could not read CSV header user_id=%s filename=%s", update.effective_user.id, filename)
-        final_path.unlink(missing_ok=True)
-        await status_message.edit_text(
-            "❌ خواندن سرستون‌های فایل ناموفق بود؛ فایل حذف شد و ورود اطلاعات شروع نشد."
-        )
+        reference = parse_drive_share_link(message.text or "")
+    except ValueError:
+        await message.reply_text("لینک معتبرِ فایل Google Drive را به‌تنهایی در گفت‌وگوی خصوصی بفرستید؛ لینک پوشه قابل دریافت نیست.")
         return
-    if context.user_data.get(UPLOAD_SELECTION_KEY):
-        final_path.unlink(missing_ok=True)
-        await status_message.edit_text("❌ برای این حساب انتخاب ستونی باز است. ابتدا آن را تأیید یا لغو کنید، سپس فایل بعدی را بفرستید.")
+
+    settings.data_directory.mkdir(parents=True, exist_ok=True)
+    temporary_path = safe_upload_path(settings.data_directory, "drive_upload.csv", source_prefix="drive")
+    context.user_data[UPLOAD_TRANSFER_KEY] = "google_drive"
+    try:
+        status_message = await message.reply_text("🔎 لینک بررسی شد؛ در حال دریافت فایل از Google Drive…")
+    except Exception:
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        raise
+    context.application.create_task(
+        _download_drive_upload(update, context, settings, reference, temporary_path, status_message),
+        update=update,
+        name="google-drive-csv-download",
+    )
+
+
+async def drive_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
         return
-    job = UploadJob(
-        path=final_path,
-        original_filename=filename,
-        file_id=document.file_id,
-        file_unique_id=document.file_unique_id,
-        file_size=document.file_size,
-        uploader_id=update.effective_user.id,
-        chat_id=update.effective_chat.id,
-        status_message_id=status_message.message_id,
-    )
-    selection = UploadSelectionSession(
-        token=secrets.token_urlsafe(6),
-        job=job,
-        headers=tuple(headers),
-        selected=set(),
-    )
-    context.user_data[UPLOAD_SELECTION_KEY] = selection
-    await status_message.edit_text(
-        f"✅ دریافت فایل کامل شد\n{filename}\n"
-        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(headers)} ستون).\n"
-        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند.",
-        reply_markup=upload_selection_keyboard(selection),
+    await update.effective_message.reply_text(
+        "برای دریافت فایل از Google Drive نیازی به Google Cloud API یا کلید حساب نیست. "
+        "در تنظیمات اشتراک‌گذاری فایل، دسترسی را روی «هرکسی که لینک را دارد — مشاهده‌گر» بگذارید و سپس لینک فایل CSV را در همین گفت‌وگوی خصوصی بفرستید. "
+        "لینک پوشه یا Google Sheets پذیرفته نیست؛ فایل باید CSV یا TXT باشد."
     )
 
 
@@ -864,7 +1047,8 @@ def _admin_panel_text(settings: Settings) -> str:
         "تغییر حالت: /access private یا /access public\n"
         "تغییر نام هدر سراسری: /header_set NATIONAL_CODE = کد ملی\n"
         "دیدن نام‌های هدر: /header_aliases\n"
-        "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n\n"
+        "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n"
+        "آماده‌سازی دریافت از Google Drive: /drive_setup\n\n"
         "حالت عمومی فقط جست‌وجو را برای همه باز می‌کند؛ بارگذاری فایل همچنان فقط برای کاربران مجاز است."
     )
 
@@ -1126,7 +1310,7 @@ def main() -> None:
         settings = load_settings()
         # A fresh Railway/container deployment may not have a CSV or database yet.
         # Create the empty schema first so the bot can start and receive its first
-        # CSV through Telegram upload.
+        # CSV through Telegram upload or the configured Google Drive link flow.
         connection = connect(settings.database_path)
         try:
             initialize_database(connection)
@@ -1164,10 +1348,17 @@ def main() -> None:
     application.add_handler(CommandHandler("header_set", header_set_command))
     application.add_handler(CommandHandler("header_aliases", header_aliases_command))
     application.add_handler(CommandHandler("header_remove", header_remove_command))
+    application.add_handler(CommandHandler("drive_setup", drive_setup_command))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_upload))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(
+            r"https?://(?:drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com|drive\.googleusercontent\.com)/"
+        ),
+        google_drive_link_upload,
+    ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
 
     async def post_init(app: Application) -> None:

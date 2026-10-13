@@ -32,6 +32,7 @@ class UploadJob:
     chat_id: int
     status_message_id: int | None = None
     selected_column_indices: tuple[int, ...] | None = None
+    source_kind: str = "telegram"
 
 
 class UploadManager:
@@ -134,14 +135,16 @@ class UploadManager:
             )
             future.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
 
-        metadata = {
-            "file_id": job.file_id,
-            "file_unique_id": job.file_unique_id,
-            "filename": job.original_filename,
-            "file_size": job.file_size,
-            "uploader_id": job.uploader_id,
-            "chat_id": job.chat_id,
-        }
+        metadata = None
+        if job.source_kind == "telegram":
+            metadata = {
+                "file_id": job.file_id,
+                "file_unique_id": job.file_unique_id,
+                "filename": job.original_filename,
+                "file_size": job.file_size,
+                "uploader_id": job.uploader_id,
+                "chat_id": job.chat_id,
+            }
 
         def import_sync() -> tuple[int, int]:
             connection = connect(self.settings.database_path)
@@ -195,10 +198,16 @@ def _format_bytes(value: float) -> str:
     return f"{value:.1f} B"
 
 
-def safe_upload_path(data_directory: Path, original_filename: str) -> Path:
+def safe_upload_path(
+    data_directory: Path,
+    original_filename: str,
+    *,
+    source_prefix: str = "telegram",
+) -> Path:
     """Create a non-colliding .part path inside the configured import directory."""
     name = Path(original_filename).name
     name = _SAFE_NAME.sub("_", name).strip("._") or "upload.csv"
     if Path(name).suffix.lower() not in {".csv", ".txt"}:
         name += ".csv"
-    return data_directory / f".telegram-{secrets.token_hex(10)}-{name}.part"
+    prefix = _SAFE_NAME.sub("_", source_prefix).strip("._") or "upload"
+    return data_directory / f".{prefix}-{secrets.token_hex(10)}-{name}.part"

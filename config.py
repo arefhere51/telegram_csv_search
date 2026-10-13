@@ -93,7 +93,6 @@ class Settings:
     telegram_file_base_url: str
     admin_user_ids: FrozenSet[int] = frozenset()
     initial_access_mode: str = "private"
-
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(PROJECT_ROOT / ".env", override=False)
@@ -133,8 +132,9 @@ class Settings:
             prefix_search_min_length=_env_int("PREFIX_SEARCH_MIN_LENGTH", 3, minimum=2),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             upload_enabled=_env_bool("UPLOAD_ENABLED", True),
-            # Local Bot API Server supports files up to about 2 GB.
-            upload_max_bytes=_env_int("UPLOAD_MAX_BYTES", 2_000_000_000, minimum=1),
+            # A generous application-side cap; Telegram/account and local Bot API
+            # behavior still determines what can actually be transferred.
+            upload_max_bytes=_env_int("UPLOAD_MAX_BYTES", 10_737_418_240, minimum=1),
             upload_progress_interval_seconds=float(os.getenv("UPLOAD_PROGRESS_INTERVAL_SECONDS", "3")),
             delete_csv_after_import=_env_bool("DELETE_CSV_AFTER_IMPORT", False),
             # Cloud Bot API is the default. For files over 20 MB, configure a local

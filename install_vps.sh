@@ -102,12 +102,13 @@ CSV_DELIMITER="$(ask_value "CSV delimiter (one character)" ",")"
 [[ ${#CSV_DELIMITER} -eq 1 ]] || die "CSV delimiter must be exactly one character."
 CSV_ENCODING="$(ask_value "CSV encoding" "utf-8-sig")"
 UPLOAD_ENABLED="$(ask_yes_no "Allow authorized private-chat CSV uploads?" "y")"
-LOCAL_API_ENABLED="$(ask_yes_no "Use a Local Bot API Server for files larger than 20 MB?" "n")"
+LOCAL_API_ENABLED="$(ask_yes_no "Connect to an already running Local Bot API Server for large files?" "n")"
 TELEGRAM_BASE_URL="https://api.telegram.org/bot"
 TELEGRAM_FILE_BASE_URL="https://api.telegram.org/file/bot"
 if [[ "$LOCAL_API_ENABLED" == "true" ]]; then
   TELEGRAM_BASE_URL="$(ask_value "Local Bot API base URL" "http://127.0.0.1:8081/bot")"
   TELEGRAM_FILE_BASE_URL="$(ask_value "Local Bot API file URL" "http://127.0.0.1:8081/file/bot")"
+  warn "This only configures the bot's URLs. It does not install or start Local Bot API Server; run that server separately in --local mode."
 fi
 
 mkdir -p "$PROJECT_DIR"/{data,database,logs}
@@ -148,7 +149,7 @@ PREFIX_SEARCH_MIN_LENGTH=3
 PHONE_NORMALIZATION=true
 LOG_LEVEL=INFO
 UPLOAD_ENABLED=$UPLOAD_ENABLED
-UPLOAD_MAX_BYTES=2000000000
+UPLOAD_MAX_BYTES=10737418240
 UPLOAD_PROGRESS_INTERVAL_SECONDS=3
 # CSV is the authoritative data source and must remain available for search hydration.
 DELETE_CSV_AFTER_IMPORT=false
