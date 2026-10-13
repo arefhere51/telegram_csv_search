@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import fcntl
 from dataclasses import dataclass, replace
 from html import escape
 import io
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import secrets
 import tempfile
@@ -70,6 +72,28 @@ UPLOAD_HEADER_PAGE_SIZE = 8
 SEARCH_PREVIEW_LIMIT = 5
 SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
+
+
+class BotInstanceAlreadyRunning(RuntimeError):
+    """Raised when another bot process already holds this project's lock."""
+
+
+def acquire_instance_lock(lock_path: Path):
+    """Acquire an OS lock so duplicate processes on this host fail before polling."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise BotInstanceAlreadyRunning(
+            "یک نمونه از ربات همین پروژه در حال اجراست؛ نمونهٔ دوم اجرا نشد."
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,6 +676,14 @@ def upload_selection_keyboard(session: UploadSelectionSession) -> InlineKeyboard
     start = session.page * UPLOAD_HEADER_PAGE_SIZE
     end = min(start + UPLOAD_HEADER_PAGE_SIZE, len(session.headers))
     rows: list[list[InlineKeyboardButton]] = []
+    navigation: list[InlineKeyboardButton] = []
+    if session.page > 0:
+        navigation.append(InlineKeyboardButton("← قبلی", callback_data=f"u:{session.token}:p:{session.page - 1}"))
+    if end < len(session.headers):
+        navigation.append(InlineKeyboardButton("بعدی →", callback_data=f"u:{session.token}:p:{session.page + 1}"))
+    # Put paging controls before the list so they remain visible on mobile clients.
+    if navigation:
+        rows.append(navigation)
     for index in range(start, end):
         checked = index in session.selected
         label = truncate(session.headers[index], 42)
@@ -659,18 +691,24 @@ def upload_selection_keyboard(session: UploadSelectionSession) -> InlineKeyboard
             f"{'☑' if checked else '☐'} {label}",
             callback_data=f"u:{session.token}:t:{index}",
         )])
-    navigation: list[InlineKeyboardButton] = []
-    if session.page > 0:
-        navigation.append(InlineKeyboardButton("← قبلی", callback_data=f"u:{session.token}:p:{session.page - 1}"))
-    if end < len(session.headers):
-        navigation.append(InlineKeyboardButton("بعدی →", callback_data=f"u:{session.token}:p:{session.page + 1}"))
-    if navigation:
-        rows.append(navigation)
     rows.append([
         InlineKeyboardButton("✅ تأیید انتخاب", callback_data=f"u:{session.token}:done"),
         InlineKeyboardButton("لغو", callback_data=f"u:{session.token}:cancel"),
     ])
     return InlineKeyboardMarkup(rows)
+
+
+def upload_selection_prompt(session: UploadSelectionSession) -> str:
+    total_pages = max(math.ceil(len(session.headers) / UPLOAD_HEADER_PAGE_SIZE), 1)
+    page_note = f"صفحهٔ {session.page + 1} از {total_pages}."
+    if total_pages > 1:
+        page_note += " برای دیدن بقیهٔ ستون‌ها، «بعدی →» را بالای فهرست بزنید."
+    return (
+        f"✅ دریافت فایل کامل شد\n{session.job.original_filename}\n"
+        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(session.headers)} ستون).\n"
+        f"{page_note}\n"
+        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند."
+    )
 
 
 async def upload_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -721,7 +759,10 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
             return
         session.page = page
         await callback.answer()
-        await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
+        await callback.edit_message_text(
+            upload_selection_prompt(session),
+            reply_markup=upload_selection_keyboard(session),
+        )
         return
     if action == "cancel":
         sessions.pop(UPLOAD_SELECTION_KEY, None)
@@ -775,9 +816,7 @@ async def show_upload_header_selection(
     )
     context.user_data[UPLOAD_SELECTION_KEY] = selection
     await status_message.edit_text(
-        f"✅ دریافت فایل کامل شد\n{job.original_filename}\n"
-        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(headers)} ستون).\n"
-        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند.",
+        upload_selection_prompt(selection),
         reply_markup=upload_selection_keyboard(selection),
     )
 
@@ -1306,8 +1345,16 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
+    instance_lock = None
     try:
         settings = load_settings()
+        settings.validate_for_bot()
+        try:
+            instance_lock = acquire_instance_lock(
+                settings.data_directory / ".telegram-csv-search.lock"
+            )
+        except BotInstanceAlreadyRunning as exc:
+            raise SystemExit(str(exc)) from exc
         # A fresh Railway/container deployment may not have a CSV or database yet.
         # Create the empty schema first so the bot can start and receive its first
         # CSV through Telegram upload or the configured Google Drive link flow.
@@ -1317,7 +1364,6 @@ def main() -> None:
             initialize_access_control(connection, settings)
         finally:
             connection.close()
-        settings.validate_for_bot()
     except ConfigurationError as exc:
         raise SystemExit(f"Configuration error: {exc}")
     global LOGGER
@@ -1369,7 +1415,11 @@ def main() -> None:
 
     application.post_init = post_init
     application.post_shutdown = post_shutdown
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    finally:
+        if instance_lock is not None:
+            instance_lock.close()
 
 
 if __name__ == "__main__":
