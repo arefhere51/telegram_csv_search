@@ -8,6 +8,7 @@ from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from config import Settings
 from database import (
@@ -27,7 +28,7 @@ from database import (
     set_access_mode,
     set_header_alias,
 )
-from import_csv import import_one_file
+from import_csv import OffsetCsvReader, import_one_file
 from search import parse_raw_fields, search_records
 from upload_manager import safe_upload_path
 from bot import (
@@ -197,6 +198,59 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["name"], "مریم")
         self.assertEqual(result.rows[0]["source_line"], 2)
         self.assertEqual(parse_raw_fields(result.rows[0])[3], "خط اول\r\nخط دوم، تهران")
+
+    def test_invalid_utf8_byte_is_replaced_and_file_import_completes(self) -> None:
+        source = self.data_directory / "invalid-byte.csv"
+        source.write_bytes(b"id,name\n1,Alpha\n2,Bad\x99Name\n3,Leila\n")
+        processed, inserted = import_one_file(self.connection, source, self.settings)
+        build_search_indexes(self.connection)
+
+        self.assertEqual(processed, 3)
+        self.assertEqual(inserted, 3)
+        result = search_records(self.connection, "Bad", 0, self.settings)
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.rows[0]["column_2"], "Bad\ufffdName")
+
+    def test_failed_import_cleans_committed_partial_batches(self) -> None:
+        source = self.data_directory / "forced-failure.csv"
+        source.write_text("partial-a\npartial-b\npartial-c\n", encoding="utf-8")
+        original_read_record = OffsetCsvReader.read_record
+        calls = 0
+
+        def fail_after_first_batch(reader):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise ValueError("simulated decode failure")
+            return original_read_record(reader)
+
+        with patch("import_csv.OffsetCsvReader.read_record", new=fail_after_first_batch):
+            with self.assertRaisesRegex(ValueError, "simulated decode failure"):
+                import_one_file(self.connection, source, self.settings)
+
+        file_row = self.connection.execute(
+            "SELECT id, status FROM imported_files WHERE relative_path = 'forced-failure.csv'"
+        ).fetchone()
+        self.assertEqual(file_row["status"], "failed")
+        self.assertEqual(
+            int(self.connection.execute(
+                "SELECT COUNT(*) FROM records WHERE source_file_id = ?", (file_row["id"],)
+            ).fetchone()[0]),
+            0,
+        )
+
+    def test_failed_file_rows_are_excluded_from_search(self) -> None:
+        source = self.data_directory / "failed-search.csv"
+        source.write_text("uniquefailedterm,unused\n", encoding="utf-8")
+        import_one_file(self.connection, source, self.settings)
+        build_search_indexes(self.connection)
+        self.connection.execute(
+            "UPDATE imported_files SET status = 'failed' WHERE relative_path = 'failed-search.csv'"
+        )
+        self.connection.commit()
+
+        result = search_records(self.connection, "uniquefailedterm", 0, self.settings)
+        self.assertEqual(result.total_count, 0)
 
     def test_result_preview_includes_unselected_and_empty_columns(self) -> None:
         row = {

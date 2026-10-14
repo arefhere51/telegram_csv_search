@@ -47,10 +47,13 @@ class _DecodedBinaryLines:
 
     def __init__(self, source: BinaryIO, encoding: str):
         self.source = source
-        self.decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        # CSVs from exports may contain a few malformed bytes even when most of the
+        # file is UTF-8. Replace only invalid sequences so a multi-GB import can finish.
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
         self.position = source.tell()
         self.physical_lines = 0
         self._finished = False
+        self.replacement_markers = 0
 
     def __iter__(self) -> Iterator[str]:
         return self
@@ -62,9 +65,12 @@ class _DecodedBinaryLines:
         if raw_line:
             self.position = self.source.tell()
             self.physical_lines += 1
-            return self.decoder.decode(raw_line, final=False)
+            decoded = self.decoder.decode(raw_line, final=False)
+            self.replacement_markers += decoded.count("\ufffd")
+            return decoded
         self._finished = True
         tail = self.decoder.decode(b"", final=True)
+        self.replacement_markers += tail.count("\ufffd")
         if tail:
             return tail
         raise StopIteration
@@ -422,6 +428,11 @@ def import_one_file(
             )
             update_import_progress(connection, file_id, rows_inserted, last_source_line)
             connection.commit()
+        if reader.lines.replacement_markers:
+            LOGGER.warning(
+                "CSV decoding produced %d U+FFFD replacement markers; some source characters may be invalid or already replaced file=%s encoding=%s",
+                reader.lines.replacement_markers, relative_path, settings.csv_encoding,
+            )
         mark_file_completed(connection, file_id, rows_inserted)
         message = _progress_message(
                 relative_path, rows_processed, rows_inserted, stat.st_size,
@@ -437,6 +448,11 @@ def import_one_file(
             progress_callback(message)
         return rows_processed, rows_inserted
     except (csv.Error, OSError, UnicodeError, ValueError, sqlite3.Error) as exc:  # type: ignore[name-defined]
+        try:
+            remove_records_for_source(connection, file_id)
+        except sqlite3.Error:
+            LOGGER.exception("Could not remove partial records after import failure file=%s", relative_path)
+            connection.rollback()
         mark_file_failed(connection, file_id, str(exc))
         raise
 

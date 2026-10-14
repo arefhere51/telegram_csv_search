@@ -113,7 +113,7 @@ def _hydrate_row(hit: sqlite3.Row, settings: Settings) -> HydratedRow:
     encoding = str(hit["csv_encoding"])
     delimiter = str(hit["csv_delimiter"])
     try:
-        decoded = raw_record.decode(encoding)
+        decoded = raw_record.decode(encoding, errors="replace")
         parsed = list(csv.reader(io.StringIO(decoded, newline=""), delimiter=delimiter))
     except (UnicodeError, csv.Error) as exc:
         raise OSError(
@@ -159,13 +159,20 @@ def _rows_and_count(
         f"SELECT {_HIT_COLUMNS} "
         "FROM records r JOIN imported_files f ON f.id = r.source_file_id "
     )
-    count_sql = "SELECT COUNT(*) FROM records r "
+    count_sql = (
+        "SELECT COUNT(*) FROM records r "
+        "JOIN imported_files f ON f.id = r.source_file_id "
+    )
+    predicate = where_sql.strip()
+    if predicate[:5].upper() == "WHERE":
+        predicate = predicate[5:].strip()
+    completed_where = f"WHERE ({predicate}) AND f.status = 'completed'"
     rows = connection.execute(
-        base_sql + where_sql + " ORDER BY r.id LIMIT ? OFFSET ?",
+        base_sql + completed_where + " ORDER BY r.id LIMIT ? OFFSET ?",
         tuple(parameters) + (settings.results_per_page, offset),
     ).fetchall()
     total_count = (
-        int(connection.execute(count_sql + where_sql, tuple(parameters)).fetchone()[0])
+        int(connection.execute(count_sql + completed_where, tuple(parameters)).fetchone()[0])
         if count_total else 0
     )
     return _hydrate_rows(rows, settings), total_count
@@ -183,11 +190,18 @@ def _all_fields_rows_and_count(
     base_sql = (
         f"SELECT {_HIT_COLUMNS} "
         "FROM records_all_fts JOIN records r ON r.id = records_all_fts.rowid "
-        "JOIN imported_files f ON f.id = r.source_file_id WHERE records_all_fts MATCH ? "
+        "JOIN imported_files f ON f.id = r.source_file_id "
+        "WHERE records_all_fts MATCH ? AND f.status = 'completed' "
     )
     rows = connection.execute(base_sql + "ORDER BY records_all_fts.rank, r.id LIMIT ? OFFSET ?", (fts_query, settings.results_per_page, offset)).fetchall()
     total = (
-        int(connection.execute("SELECT COUNT(*) FROM records_all_fts WHERE records_all_fts MATCH ?", (fts_query,)).fetchone()[0])
+        int(connection.execute(
+            """SELECT COUNT(*) FROM records_all_fts
+               JOIN records r ON r.id = records_all_fts.rowid
+               JOIN imported_files f ON f.id = r.source_file_id
+               WHERE records_all_fts MATCH ? AND f.status = 'completed'""",
+            (fts_query,),
+        ).fetchone()[0])
         if count_total else 0
     )
     return _hydrate_rows(rows, settings), total
