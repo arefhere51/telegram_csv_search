@@ -54,7 +54,15 @@ class DatabaseManagementTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            result = _archive_and_delete_database_file(settings, file_id)
+            progress_events: list[tuple[str, float]] = []
+            result = _archive_and_delete_database_file(
+                settings,
+                file_id,
+                progress_callback=lambda stage, percent: progress_events.append((stage, percent)),
+            )
+            self.assertEqual(progress_events[0][1], 0.0)
+            self.assertEqual(progress_events[-1][1], 100.0)
+            self.assertTrue(any("آرشیو" in stage for stage, _ in progress_events))
             self.assertIsNotNone(result)
             deleted, archived_path = result
             self.assertEqual(deleted["record_count"], 2)
@@ -82,7 +90,8 @@ class DatabaseManagementTests(unittest.TestCase):
         chat_text = _progress_message("File-no43.csv", 10, 10, 100, handle, started)
         log_text = _progress_log_message("File-no43.csv", 10, 10, 100, handle, started)
         self.assertIn("ردیف", chat_text)
-        self.assertIn("File:", log_text)
+        self.assertIn("stage=csv_import_progress", log_text)
+        self.assertIn("file=File-no43.csv", log_text)
         self.assertIn("rows_inserted:", log_text)
         self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in log_text))
 

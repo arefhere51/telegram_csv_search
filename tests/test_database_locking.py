@@ -43,6 +43,21 @@ class DatabaseLockingTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_index_builder_reports_progress_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connection = connect(Path(temporary_directory) / "progress.db")
+            events: list[tuple[str, float]] = []
+            try:
+                initialize_database(connection)
+                build_search_indexes(connection, progress_callback=lambda stage, percent: events.append((stage, percent)))
+                self.assertEqual(events[0][1], 0.0)
+                self.assertEqual(events[-1][1], 100.0)
+                self.assertTrue(any("FTS" in stage for stage, _ in events))
+                self.assertTrue(any("ساخته شد" in stage for stage, _ in events))
+                self.assertEqual([percent for _, percent in events], sorted(percent for _, percent in events))
+            finally:
+                connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

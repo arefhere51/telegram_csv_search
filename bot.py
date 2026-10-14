@@ -18,7 +18,8 @@ import secrets
 import shutil
 import tempfile
 import time
-from typing import Any
+import traceback
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -31,6 +32,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -66,6 +68,7 @@ from database import (
     set_header_alias,
 )
 from logging_utils import configure_logging
+from progress_utils import new_operation_id, progress_text
 from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
 from import_csv import read_csv_header
@@ -81,6 +84,15 @@ SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
 DATABASE_MANAGEMENT_PAGE_SIZE = 8
 TEXT_SEND_TIMEOUT_SECONDS = 30
+
+
+def _log_exception_redacted(message: str, error: BaseException, *secrets_to_redact: str | None) -> None:
+    """Log a full traceback while removing credentials and link tokens first."""
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    for secret in secrets_to_redact:
+        if secret:
+            formatted = formatted.replace(secret, "[REDACTED]")
+    LOGGER.error("%s\n%s", message, formatted.rstrip())
 
 
 class BotInstanceAlreadyRunning(RuntimeError):
@@ -279,6 +291,7 @@ def write_search_text_exports(
     page_size: int = SEARCH_EXPORT_PAGE_SIZE,
     max_chunk_bytes: int = SEARCH_EXPORT_CHUNK_BYTES,
     filename_prefix: str = "نتایج_جست‌وجو",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[Path]:
     """Stream every match to bounded UTF-8 TXT chunks without truncating values."""
     if page_size < 1 or max_chunk_bytes < 4:
@@ -288,6 +301,8 @@ def write_search_text_exports(
     total = first.total_count
     if total <= 0:
         return []
+    if progress_callback:
+        progress_callback(0, total)
     destination.mkdir(parents=True, exist_ok=True)
     filename_prefix = re.sub(r"[^\w-]+", "_", filename_prefix, flags=re.UNICODE).strip("_-")
     filename_prefix = truncate(filename_prefix, 64) or "نتایج_جست‌وجو"
@@ -345,6 +360,8 @@ def write_search_text_exports(
                     handle = None
                     written = 0
                 write_payload(record)
+            if progress_callback:
+                progress_callback(min((page + 1) * page_size, total), total)
         if not paths:
             raise RuntimeError("Search count was positive but no rows were returned.")
     finally:
@@ -491,96 +508,251 @@ async def respond_to_search(
             f"عبارت جست‌وجو بیش از حد طولانی است؛ حداکثر {settings.max_query_length} نویسه مجاز است."
         )
         return
+    operation_id = new_operation_id()
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data["active_operation_id"] = operation_id
+    LOGGER.info(
+        "operation=search operation_id=%s stage=received user_id=%s query_length=%d",
+        operation_id, update.effective_user.id, len(query),
+    )
+    status = await update.effective_message.reply_text(progress_text(
+        "🔎 جست‌وجو",
+        "در حال آماده‌سازی عبارت و اتصال به پایگاه‌داده",
+        0,
+        operation_id=operation_id,
+    ))
     started = time.perf_counter()
     try:
+        await status.edit_text(progress_text(
+            "🔎 جست‌وجو",
+            "در حال جست‌وجو در شاخص‌های پایگاه‌داده",
+            20,
+            operation_id=operation_id,
+        ))
         result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        LOGGER.info(
+            "operation=search operation_id=%s stage=query_complete user_id=%s mode=%s results=%d duration_ms=%.1f",
+            operation_id, update.effective_user.id, result.mode, result.total_count, elapsed_ms,
+        )
+        await status.edit_text(progress_text(
+            "🔎 جست‌وجو",
+            "خواندن عنوان ستون‌ها و آماده‌سازی نمایش نتیجه",
+            60,
+            operation_id=operation_id,
+            detail=f"تعداد رکوردهای منطبق: {result.total_count:,}",
+        ))
         aliases = await asyncio.to_thread(load_display_header_aliases, settings)
-    except Exception:
-        LOGGER.exception("Search failed for user id=%s", update.effective_user.id)
-        await update.effective_message.reply_text("جست‌وجو موقتاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.")
-        return
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    LOGGER.info(
-        "Search completed user_id=%s query_length=%d mode=%s results=%d duration_ms=%.1f",
-        update.effective_user.id, len(query), result.mode, result.total_count, elapsed_ms,
-    )
-    if not result.total_count:
-        await update.effective_message.reply_text("نتیجه‌ای پیدا نشد. عبارت دقیق‌تر یا کامل‌تری را امتحان کنید.")
-        return
-
-    if result.total_count <= SEARCH_PREVIEW_LIMIT:
-        await update.effective_message.reply_text(
-            format_search_preview(query, result, settings, aliases),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
-
-    status = await update.effective_message.reply_text(
-        f"در حال آماده‌سازی فایل متنی برای {result.total_count:,} نتیجه…"
-    )
-    try:
-        with tempfile.TemporaryDirectory(prefix="telegram-search-results-") as temp_dir:
-            safe_query = re.sub(r"[^\w-]+", "_", query, flags=re.UNICODE).strip("_-")
-            safe_query = truncate(safe_query, 48).strip("_-") or "جست‌وجو"
-            paths = await asyncio.to_thread(
-                write_search_text_exports,
-                settings,
-                query,
-                Path(temp_dir),
-                aliases,
-                filename_prefix=f"نتایج_{safe_query}",
+        if not result.total_count:
+            LOGGER.info(
+                "operation=search operation_id=%s stage=complete_no_results user_id=%s duration_ms=%.1f",
+                operation_id, update.effective_user.id, (time.perf_counter() - started) * 1000,
             )
-            if not paths:
-                raise RuntimeError("Search returned a positive count but produced no text export files.")
-            for part_number, path in enumerate(paths, start=1):
+            await status.edit_text(progress_text(
+                "✅ جست‌وجو کامل شد",
+                "نتیجه‌ای پیدا نشد",
+                100,
+                operation_id=operation_id,
+                detail="عبارت دقیق‌تر یا کامل‌تری را امتحان کنید.",
+            ))
+            return
+
+        if result.total_count <= SEARCH_PREVIEW_LIMIT:
+            preview = format_search_preview(query, result, settings, aliases)
+            LOGGER.info(
+                "operation=search operation_id=%s stage=preview_ready user_id=%s results=%d",
+                operation_id, update.effective_user.id, result.total_count,
+            )
+            await status.edit_text(
+                progress_text(
+                    "✅ جست‌وجو کامل شد",
+                    "نتیجه آماده و ارسال شد",
+                    100,
+                    operation_id=operation_id,
+                ) + "\n\n" + preview,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
+        await status.edit_text(progress_text(
+            "📄 ساخت فایل نتیجه‌ها",
+            "در حال آماده‌سازی فایل TXT برای همهٔ رکوردها",
+            65,
+            operation_id=operation_id,
+            detail=f"تعداد رکوردها: {result.total_count:,}",
+        ))
+        loop = asyncio.get_running_loop()
+        export_queue: asyncio.Queue[tuple[int, int] | None] = asyncio.Queue()
+        last_export_update = 0.0
+        last_export_percent = -1.0
+
+        def export_progress(completed: int, total: int) -> None:
+            nonlocal last_export_update, last_export_percent
+            now = time.monotonic()
+            percent = completed / max(total, 1) * 100
+            if (
+                completed == 0 or completed >= total or now - last_export_update >= 3
+                or percent - last_export_percent >= 5
+            ):
+                last_export_update = now
+                last_export_percent = percent
+                LOGGER.info(
+                    "operation=search operation_id=%s stage=txt_export progress=%.1f records=%d total=%d",
+                    operation_id, percent, completed, total,
+                )
                 try:
-                    await status.edit_text(
-                        f"در حال ارسال فایل متنی {part_number} از {len(paths)}؛ "
-                        "لطفاً تا ۳۰ ثانیه منتظر بمانید…"
+                    loop.call_soon_threadsafe(export_queue.put_nowait, (completed, total))
+                except RuntimeError:
+                    LOGGER.warning(
+                        "operation=search operation_id=%s stage=txt_progress_loop_unavailable",
+                        operation_id,
                     )
-                except Exception:
-                    LOGGER.warning("Could not update text export status before sending part=%s", part_number)
-                with path.open("rb") as document:
-                    await asyncio.wait_for(
-                        context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=document,
-                            filename=path.name,
-                            caption=(
-                                f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}\n"
-                                f"بخش {part_number} از {len(paths)}؛ همهٔ فیلدهای کامل ردیف‌های منطبق."
-                            ),
-                            read_timeout=TEXT_SEND_TIMEOUT_SECONDS,
-                            write_timeout=TEXT_SEND_TIMEOUT_SECONDS,
-                            connect_timeout=TEXT_SEND_TIMEOUT_SECONDS,
-                            pool_timeout=TEXT_SEND_TIMEOUT_SECONDS,
-                        ),
-                        timeout=TEXT_SEND_TIMEOUT_SECONDS,
-                    )
+
+        async def consume_export_progress() -> None:
+            while True:
+                item = await export_queue.get()
+                if item is None:
+                    return
+                completed, total = item
+                pct = 65.0 + 22.0 * completed / max(total, 1)
                 try:
-                    await status.edit_text(f"✅ فایل متنی {part_number} از {len(paths)} ارسال شد.")
+                    await status.edit_text(progress_text(
+                        "📄 ساخت فایل نتیجه‌ها",
+                        "در حال نوشتن رکوردها در فایل TXT",
+                        pct,
+                        operation_id=operation_id,
+                        detail=f"{completed:,} از {total:,} رکورد پردازش شد",
+                    ))
                 except Exception:
-                    LOGGER.warning("Could not update text export status after sending part=%s", part_number)
-            try:
-                await status.edit_text("✅ ارسال همهٔ فایل‌های نتیجه کامل شد.")
-            except Exception:
-                LOGGER.warning("Could not update final text export status")
-    except (asyncio.TimeoutError, TimedOut):
-        LOGGER.warning(
-            "Text search result upload timed out after 30 seconds user_id=%s query_length=%d",
-            update.effective_user.id, len(query),
+                    LOGGER.exception(
+                        "operation=search operation_id=%s stage=txt_progress_message_failed",
+                        operation_id,
+                    )
+
+        progress_task: asyncio.Task | None = asyncio.create_task(
+            consume_export_progress(), name=f"txt-progress-{operation_id}"
         )
+
+        async def stop_export_progress() -> None:
+            nonlocal progress_task
+            if progress_task is None:
+                return
+            # Let any callbacks queued by the worker thread arrive before the sentinel.
+            await asyncio.sleep(0)
+            export_queue.put_nowait(None)
+            await progress_task
+            progress_task = None
+
+        delivery_failure: tuple[str, str] | None = None
         try:
-            await status.edit_text("ارسال فایل تا ۳۰ ثانیه کامل نشد؛ مشکلی در ارتباط پیش آمد. لطفاً کمی بعد دوباره تلاش کنید.")
-        except Exception:
-            LOGGER.warning("Could not update text export timeout status")
-    except Exception:
-        LOGGER.exception("Could not create/send full text search results user_id=%s", update.effective_user.id)
-        try:
-            await status.edit_text("ساخت یا ارسال فایل نتیجه‌ها با مشکل روبه‌رو شد؛ لطفاً کمی بعد دوباره تلاش کنید.")
-        except Exception:
-            LOGGER.warning("Could not update text export failure status")
+            with tempfile.TemporaryDirectory(prefix="telegram-search-results-") as temp_dir:
+                safe_query = re.sub(r"[^\w-]+", "_", query, flags=re.UNICODE).strip("_-")
+                safe_query = truncate(safe_query, 48).strip("_-") or "جست‌وجو"
+                paths = await asyncio.to_thread(
+                    write_search_text_exports,
+                    settings,
+                    query,
+                    Path(temp_dir),
+                    aliases,
+                    filename_prefix=f"نتایج_{safe_query}",
+                    progress_callback=export_progress,
+                )
+                await stop_export_progress()
+                if not paths:
+                    raise RuntimeError("Search returned a positive count but produced no text export files.")
+                LOGGER.info(
+                    "operation=search operation_id=%s stage=txt_export_complete parts=%d results=%d",
+                    operation_id, len(paths), result.total_count,
+                )
+                for part_number, path in enumerate(paths, start=1):
+                    part_percent = 87.0 + 12.0 * (part_number - 1) / max(len(paths), 1)
+                    await status.edit_text(progress_text(
+                        "📤 ارسال فایل نتیجه‌ها",
+                        f"در حال ارسال بخش {part_number} از {len(paths)}",
+                        part_percent,
+                        operation_id=operation_id,
+                    ))
+                    LOGGER.info(
+                        "operation=search operation_id=%s stage=txt_send_started part=%d parts=%d filename=%s",
+                        operation_id, part_number, len(paths), path.name,
+                    )
+                    with path.open("rb") as document:
+                        await asyncio.wait_for(
+                            context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=document,
+                                filename=path.name,
+                                caption=(
+                                    f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}\n"
+                                    f"بخش {part_number} از {len(paths)}؛ همهٔ فیلدهای کامل ردیف‌های منطبق."
+                                ),
+                                read_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                                write_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                                connect_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                                pool_timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                            ),
+                            timeout=TEXT_SEND_TIMEOUT_SECONDS,
+                        )
+                    LOGGER.info(
+                        "operation=search operation_id=%s stage=txt_send_complete part=%d parts=%d",
+                        operation_id, part_number, len(paths),
+                    )
+                await status.edit_text(progress_text(
+                    "✅ جست‌وجو و ارسال کامل شد",
+                    "همهٔ فایل‌های نتیجه ارسال شدند",
+                    100,
+                    operation_id=operation_id,
+                    detail=f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}",
+                ))
+        except (asyncio.TimeoutError, TimedOut) as exc:
+            LOGGER.warning(
+                "operation=search operation_id=%s stage=txt_send_timeout user_id=%s query_length=%d timeout_seconds=%d",
+                operation_id, update.effective_user.id, len(query), TEXT_SEND_TIMEOUT_SECONDS,
+            )
+            delivery_failure = (
+                "❌ ارسال فایل نتیجه کامل نشد",
+                "مهلت ارسال ۳۰ ثانیه‌ای به پایان رسید؛ کمی بعد دوباره تلاش کنید.",
+            )
+        except Exception as exc:
+            _log_exception_redacted(
+                "operation=search operation_id=%s stage=txt_export_or_send_failed user_id=%s error_type=%s"
+                % (operation_id, update.effective_user.id, type(exc).__name__),
+                exc,
+                getattr(settings, "telegram_bot_token", None),
+            )
+            delivery_failure = (
+                "❌ ساخت یا ارسال فایل نتیجه‌ها ناموفق بود",
+                "مرحلهٔ دقیق خطا در CMD با کد پیگیری ثبت شده است",
+            )
+        finally:
+            await stop_export_progress()
+        if delivery_failure is not None:
+            title, detail = delivery_failure
+            await status.edit_text(progress_text(
+                title,
+                detail,
+                100,
+                operation_id=operation_id,
+            ))
+    except Exception as exc:
+        _log_exception_redacted(
+            "operation=search operation_id=%s stage=search_failed user_id=%s query_length=%d error_type=%s"
+            % (operation_id, update.effective_user.id, len(query), type(exc).__name__),
+            exc,
+            getattr(settings, "telegram_bot_token", None),
+        )
+        await status.edit_text(progress_text(
+            "❌ جست‌وجو ناموفق بود",
+            "مرحلهٔ دقیق خطا در CMD با کد پیگیری ثبت شده است",
+            100,
+            operation_id=operation_id,
+            detail="کد پیگیری را برای بررسی لاگ‌ها نگه دارید.",
+        ))
+    finally:
+        if isinstance(user_data, dict):
+            user_data.pop("active_operation_id", None)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -651,6 +823,7 @@ async def download_file_with_progress(
     message_id: int,
     filename: str,
     total_bytes: int | None,
+    operation_id: str | None = None,
 ) -> None:
     """Stream a Telegram file to disk and edit one status message periodically.
 
@@ -661,6 +834,59 @@ async def download_file_with_progress(
     if not file_path:
         raise RuntimeError("تلگرام مسیر قابل دریافت فایل را برنگرداند.")
     local_source = Path(file_path)
+    expected_bytes = total_bytes
+    if local_source.is_absolute() and not expected_bytes:
+        expected_bytes = local_source.stat().st_size
+    started = time.monotonic()
+    last_logged_bucket = -1
+    last_logged_bytes = 0
+
+    async def update_progress(received: int, *, complete: bool = False) -> None:
+        nonlocal last_logged_bucket, last_logged_bytes
+        elapsed = max(time.monotonic() - started, 0.001)
+        percent = 100.0 if complete else (
+            min(100.0, received / expected_bytes * 100) if expected_bytes else 0.0
+        )
+        if expected_bytes:
+            bucket = min(10, int(percent // 10))
+            should_log = bucket > last_logged_bucket or complete
+            last_logged_bucket = max(last_logged_bucket, bucket)
+        else:
+            should_log = received - last_logged_bytes >= 64 * 1024 * 1024 or complete
+        if should_log:
+            LOGGER.info(
+                "operation=telegram_download operation_id=%s stage=%s progress=%.1f received_bytes=%d expected_bytes=%s speed_bytes_per_second=%.0f",
+                operation_id or "-", "download_complete" if complete else "downloading",
+                percent, received, expected_bytes, received / elapsed,
+            )
+            last_logged_bytes = received
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=progress_text(
+                    "⬇️ دریافت فایل از Telegram",
+                    "دریافت کامل شد" if complete else "در حال دریافت فایل",
+                    percent,
+                    operation_id=operation_id,
+                    detail=(
+                        f"حجم دریافت‌شده: {_human_bytes(received)}"
+                        + (f" از {_human_bytes(expected_bytes)}" if expected_bytes else "")
+                        + f"\nسرعت: {_human_bytes(received / elapsed)} در ثانیه"
+                    ),
+                ),
+            )
+        except Exception:
+            LOGGER.exception(
+                "operation=telegram_download operation_id=%s stage=progress_message_update_failed",
+                operation_id or "-",
+            )
+
+    LOGGER.info(
+        "operation=telegram_download operation_id=%s stage=started filename=%s expected_bytes=%s",
+        operation_id or "-", filename, expected_bytes,
+    )
+    await update_progress(0)
     if local_source.is_absolute():
         if not local_source.is_file():
             raise FileNotFoundError(
@@ -668,8 +894,6 @@ async def download_file_with_progress(
                 "mount the Bot API data directory into the bot container."
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        total = total_bytes or local_source.stat().st_size
-        started = time.monotonic()
         received = 0
         last_update = 0.0
         with local_source.open("rb") as source, destination.open("wb") as output:
@@ -678,22 +902,11 @@ async def download_file_with_progress(
                 received += len(chunk)
                 now = time.monotonic()
                 if now - last_update >= settings.upload_progress_interval_seconds:
-                    elapsed = max(now - started, 0.001)
-                    percent = received / total * 100 if total else 0.0
-                    text = (
-                        f"⬇️ دریافت فایل\n{filename}\n"
-                        f"{_progress_bar(percent)} {percent:5.1f}%\n"
-                        f"حجم: {_human_bytes(received)} / {_human_bytes(total)}\n"
-                        f"سرعت: {_human_bytes(received / elapsed)} در ثانیه"
-                    )
-                    try:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-                    except Exception:
-                        LOGGER.exception("Could not update local download progress filename=%s", filename)
+                    await update_progress(received)
                     last_update = now
+        await update_progress(received, complete=True)
         return
     url = telegram_file_download_url(settings, file_path)
-    started = time.monotonic()
     last_update = 0.0
     received = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -706,20 +919,9 @@ async def download_file_with_progress(
                     received += len(chunk)
                     now = time.monotonic()
                     if now - last_update >= settings.upload_progress_interval_seconds:
-                        elapsed = max(now - started, 0.001)
-                        percent = received / total_bytes * 100 if total_bytes else 0.0
-                        text = (
-                            f"⬇️ دریافت فایل\n{filename}\n"
-                            f"{_progress_bar(percent)} {percent:5.1f}%\n"
-                            f"حجم: {_human_bytes(received)}"
-                            + (f" / {_human_bytes(total_bytes)}" if total_bytes else "")
-                            + f"\nسرعت: {_human_bytes(received / elapsed)} در ثانیه"
-                        )
-                        try:
-                            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-                        except Exception:
-                            LOGGER.exception("Could not update download progress filename=%s", filename)
+                        await update_progress(received)
                         last_update = now
+    await update_progress(received, complete=True)
 
 
 async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -760,11 +962,17 @@ def upload_selection_prompt(session: UploadSelectionSession) -> str:
     page_note = f"صفحهٔ {session.page + 1} از {total_pages}."
     if total_pages > 1:
         page_note += " برای دیدن بقیهٔ ستون‌ها، «بعدی →» را بالای فهرست بزنید."
-    return (
-        f"✅ دریافت فایل کامل شد\n{session.job.original_filename}\n"
-        f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(session.headers)} ستون).\n"
-        f"{page_note}\n"
-        "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند."
+    return progress_text(
+        "✅ دریافت فایل و خواندن سرستون‌ها کامل شد",
+        "در انتظار انتخاب ستون‌ها توسط شما",
+        100,
+        operation_id=getattr(session.job, "operation_id", None),
+        detail=(
+            f"{session.job.original_filename}\n"
+            f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(session.headers)} ستون).\n"
+            f"{page_note}\n"
+            "برای نمایش نتیجه، تمام ستون‌های همان ردیف از CSV خوانده می‌شوند."
+        ),
     )
 
 
@@ -802,6 +1010,10 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
             session.selected.remove(index)
         else:
             session.selected.add(index)
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=header_selection_toggled user_id=%s column_index=%d selected_count=%d",
+            session.job.operation_id or "-", update.effective_user.id, index, len(session.selected),
+        )
         await callback.answer()
         await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
         return
@@ -815,6 +1027,10 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
             await callback.answer("صفحه نامعتبر است.", show_alert=True)
             return
         session.page = page
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=header_selection_page user_id=%s page=%d total_pages=%d",
+            session.job.operation_id or "-", update.effective_user.id, page + 1, max_page + 1,
+        )
         await callback.answer()
         await callback.edit_message_text(
             upload_selection_prompt(session),
@@ -824,8 +1040,17 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
     if action == "cancel":
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         session.job.path.unlink(missing_ok=True)
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=cancelled_by_user user_id=%s filename=%s",
+            session.job.operation_id or "-", update.effective_user.id, session.job.original_filename,
+        )
         await callback.answer("فایل لغو شد.")
-        await callback.edit_message_text("بارگذاری و ورود اطلاعات لغو شد؛ فایل موقت حذف شد.")
+        await callback.edit_message_text(progress_text(
+            "⚪ عملیات لغو شد",
+            "فایل موقت حذف شد و ورود اطلاعات شروع نشد",
+            100,
+            operation_id=session.job.operation_id,
+        ))
         return
     if action == "done":
         if not session.selected:
@@ -834,12 +1059,23 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         job = replace(session.job, selected_column_indices=tuple(sorted(session.selected)))
         manager: UploadManager = context.application.bot_data["upload_manager"]
         position = await manager.enqueue(job)
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=header_selection_confirmed user_id=%s selected_columns=%d queue_position=%d",
+            job.operation_id or "-", update.effective_user.id, len(job.selected_column_indices or ()), position,
+        )
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         await callback.answer("انتخاب ثبت شد.")
         await callback.edit_message_text(
-            f"✅ ستون‌های انتخابی ثبت شدند\n{job.original_filename}\n"
-            f"📥 در صف ورود اطلاعات قرار گرفت؛ موقعیت: {position}\n"
-            "جست‌وجو فقط در ستون‌های انتخاب‌شده انجام می‌شود؛ همه‌ی فیلدهای ردیف نتیجه نمایش داده می‌شوند."
+            progress_text(
+                "📥 ستون‌های انتخابی ثبت شدند",
+                f"در صف ورود اطلاعات؛ موقعیت {position}",
+                0,
+                operation_id=job.operation_id,
+                detail=(
+                    f"{job.original_filename}\nجست‌وجو فقط در ستون‌های انتخاب‌شده انجام می‌شود؛ "
+                    "همهٔ فیلدهای ردیف نتیجه نمایش داده می‌شوند."
+                ),
+            )
         )
         return
     await callback.answer("عملیات ناشناخته است.", show_alert=True)
@@ -852,12 +1088,33 @@ async def show_upload_header_selection(
     status_message,
 ) -> None:
     """Read the first CSV row and show the same header picker for every source."""
+    operation_id = job.operation_id or "-"
+    LOGGER.info(
+        "operation=upload operation_id=%s stage=header_read_started user_id=%s filename=%s",
+        operation_id, job.uploader_id, job.original_filename,
+    )
+    await status_message.edit_text(progress_text(
+        "📑 آماده‌سازی فایل برای ورود",
+        "در حال خواندن سرستون‌های CSV",
+        0,
+        operation_id=job.operation_id,
+        detail=job.original_filename,
+    ))
     try:
         headers = await asyncio.to_thread(read_csv_header, job.path, settings)
     except Exception:
-        LOGGER.exception("Could not read CSV header user_id=%s filename=%s", job.uploader_id, job.original_filename)
+        LOGGER.exception(
+            "operation=upload operation_id=%s stage=header_read_failed user_id=%s filename=%s",
+            operation_id, job.uploader_id, job.original_filename,
+        )
         job.path.unlink(missing_ok=True)
-        await status_message.edit_text("❌ خواندن سرستون‌های فایل ناموفق بود؛ فایل حذف شد و ورود اطلاعات شروع نشد.")
+        await status_message.edit_text(progress_text(
+            "❌ خواندن سرستون‌ها ناموفق بود",
+            "مرحلهٔ خواندن header",
+            100,
+            operation_id=job.operation_id,
+            detail="فایل موقت حذف شد و ورود اطلاعات آغاز نشد.",
+        ))
         return
     if context.user_data.get(UPLOAD_SELECTION_KEY):
         job.path.unlink(missing_ok=True)
@@ -872,6 +1129,10 @@ async def show_upload_header_selection(
         selected=set(),
     )
     context.user_data[UPLOAD_SELECTION_KEY] = selection
+    LOGGER.info(
+        "operation=upload operation_id=%s stage=header_read_complete filename=%s columns=%d pages=%d",
+        operation_id, job.original_filename, len(headers), max(math.ceil(len(headers) / UPLOAD_HEADER_PAGE_SIZE), 1),
+    )
     await status_message.edit_text(
         upload_selection_prompt(selection),
         reply_markup=upload_selection_keyboard(selection),
@@ -884,17 +1145,33 @@ async def _download_telegram_document(
     settings: Settings,
     document,
     filename: str,
+    operation_id: str,
 ) -> None:
     message = update.effective_message
     settings.data_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = safe_upload_path(settings.data_directory, filename)
     final_path = temporary_path.with_suffix("")
-    status_message = await message.reply_text(f"📦 فایل دریافت شد\n{filename}\n⏳ آماده‌سازی دریافت…")
+    LOGGER.info(
+        "operation=telegram_upload operation_id=%s stage=upload_received user_id=%s filename=%s bytes=%s",
+        operation_id, update.effective_user.id, filename, document.file_size,
+    )
+    status_message = await message.reply_text(progress_text(
+        "📦 فایل دریافت شد",
+        "آماده‌سازی دریافت از Telegram",
+        0,
+        operation_id=operation_id,
+        detail=filename,
+    ))
     try:
+        LOGGER.info(
+            "operation=telegram_upload operation_id=%s stage=telegram_get_file_started filename=%s",
+            operation_id, filename,
+        )
         telegram_file = await context.bot.get_file(document.file_id)
         await download_file_with_progress(
             settings, telegram_file.file_path, temporary_path, context.bot,
             status_message.chat_id, status_message.message_id, filename, document.file_size,
+            operation_id=operation_id,
         )
         actual_size = temporary_path.stat().st_size
         if actual_size > settings.upload_max_bytes:
@@ -904,14 +1181,27 @@ async def _download_telegram_document(
             )
             return
         temporary_path.replace(final_path)
+        LOGGER.info(
+            "operation=telegram_upload operation_id=%s stage=download_complete filename=%s bytes=%d path=%s",
+            operation_id, filename, actual_size, final_path,
+        )
     except Exception as exc:
         detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
-        LOGGER.error(
-            "Telegram download failed user_id=%s filename=%s error_type=%s detail=%s",
-            update.effective_user.id, filename, type(exc).__name__, detail,
+        _log_exception_redacted(
+            "operation=telegram_upload operation_id=%s stage=download_failed user_id=%s filename=%s error_type=%s detail=%s"
+            % (operation_id, update.effective_user.id, filename, type(exc).__name__, detail),
+            exc,
+            settings.telegram_bot_token,
+            document.file_id,
         )
         temporary_path.unlink(missing_ok=True)
-        await status_message.edit_text("❌ دریافت فایل ناموفق بود. فایل ناقص حذف شد و ورود اطلاعات شروع نشد.")
+        await status_message.edit_text(progress_text(
+            "❌ دریافت فایل ناموفق بود",
+            "مرحلهٔ دریافت از Telegram",
+            100,
+            operation_id=operation_id,
+            detail="فایل ناقص حذف شد؛ جزئیات و traceback در CMD ثبت شد.",
+        ))
         return
     job = UploadJob(
         path=final_path,
@@ -922,6 +1212,7 @@ async def _download_telegram_document(
         uploader_id=update.effective_user.id,
         chat_id=update.effective_chat.id,
         status_message_id=status_message.message_id,
+        operation_id=operation_id,
     )
     await show_upload_header_selection(context, settings, job, status_message)
 
@@ -952,23 +1243,36 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
         return
     context.user_data[UPLOAD_TRANSFER_KEY] = "telegram"
+    operation_id = new_operation_id()
+    context.user_data["active_operation_id"] = operation_id
     try:
-        await _download_telegram_document(update, context, settings, document, filename)
+        LOGGER.info(
+            "operation=telegram_upload operation_id=%s stage=accepted user_id=%s filename=%s expected_bytes=%s",
+            operation_id, update.effective_user.id, filename, document.file_size,
+        )
+        await _download_telegram_document(update, context, settings, document, filename, operation_id)
     finally:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        context.user_data.pop("active_operation_id", None)
 
 
-def _drive_progress_text(filename: str, received: int, total: int | None, elapsed: float) -> str:
-    if total:
-        percent = received / total * 100
-        size = f"{_human_bytes(received)} / {_human_bytes(total)}"
-    else:
-        percent = 0.0
-        size = _human_bytes(received)
-    return (
-        f"🔗 دریافت از Google Drive\n{filename}\n"
-        f"{_progress_bar(percent)} {percent:5.1f}%\n"
-        f"حجم: {size}\nسرعت: {_human_bytes(received / max(elapsed, 0.001))} در ثانیه"
+def _drive_progress_text(
+    filename: str,
+    received: int,
+    total: int | None,
+    elapsed: float,
+    operation_id: str | None = None,
+    *,
+    complete: bool = False,
+) -> str:
+    percent = 100.0 if complete else (min(100.0, received / total * 100) if total else 0.0)
+    size = f"{_human_bytes(received)} / {_human_bytes(total)}" if total else _human_bytes(received)
+    return progress_text(
+        "🔗 دریافت فایل از Google Drive",
+        "دریافت کامل شد" if complete else "در حال دریافت فایل",
+        percent,
+        operation_id=operation_id,
+        detail=f"{filename}\nحجم: {size}\nسرعت: {_human_bytes(received / max(elapsed, 0.001))} در ثانیه",
     )
 
 
@@ -979,11 +1283,14 @@ async def _download_drive_upload(
     reference,
     temporary_path: Path,
     status_message,
+    operation_id: str,
 ) -> None:
     loop = asyncio.get_running_loop()
     started = time.monotonic()
     last_update = 0.0
     progress_queue: asyncio.Queue[tuple[str, int, int | None] | None] = asyncio.Queue()
+    last_logged_bucket = -1
+    last_logged_bytes = 0
 
     async def consume_progress() -> None:
         while True:
@@ -991,7 +1298,9 @@ async def _download_drive_upload(
             if item is None:
                 return
             filename, received, total = item
-            text = _drive_progress_text(filename, received, total, time.monotonic() - started)
+            text = _drive_progress_text(
+                filename, received, total, time.monotonic() - started, operation_id
+            )
             try:
                 await status_message.edit_text(text)
             except Exception:
@@ -1000,14 +1309,31 @@ async def _download_drive_upload(
     progress_task = asyncio.create_task(consume_progress(), name="google-drive-progress-updates")
 
     def progress(filename: str, received: int, total: int | None) -> None:
-        nonlocal last_update
+        nonlocal last_update, last_logged_bucket, last_logged_bytes
         now = time.monotonic()
         if received and now - last_update < settings.upload_progress_interval_seconds:
             return
         last_update = now
+        percent = min(100.0, received / total * 100) if total else 0.0
+        if total:
+            bucket = min(10, int(percent // 10))
+            should_log = bucket > last_logged_bucket
+            last_logged_bucket = max(last_logged_bucket, bucket)
+        else:
+            should_log = received - last_logged_bytes >= 64 * 1024 * 1024
+        if should_log:
+            LOGGER.info(
+                "operation=drive_upload operation_id=%s stage=downloading progress=%.1f received_bytes=%d total_bytes=%s",
+                operation_id, percent, received, total,
+            )
+            last_logged_bytes = received
         loop.call_soon_threadsafe(progress_queue.put_nowait, (filename, received, total))
 
     try:
+        LOGGER.info(
+            "operation=drive_upload operation_id=%s stage=download_started user_id=%s",
+            operation_id, update.effective_user.id,
+        )
         try:
             info = await asyncio.to_thread(
                 download_drive_csv,
@@ -1021,6 +1347,14 @@ async def _download_drive_upload(
             await progress_queue.put(None)
             await progress_task
         actual_size = temporary_path.stat().st_size
+        await status_message.edit_text(_drive_progress_text(
+            info.name, actual_size, info.size or actual_size, time.monotonic() - started,
+            operation_id, complete=True,
+        ))
+        LOGGER.info(
+            "operation=drive_upload operation_id=%s stage=download_complete filename=%s bytes=%d",
+            operation_id, info.name, actual_size,
+        )
         final_path = safe_upload_path(
             settings.data_directory, info.name, source_prefix="drive"
         ).with_suffix("")
@@ -1035,37 +1369,94 @@ async def _download_drive_upload(
             chat_id=update.effective_chat.id,
             status_message_id=status_message.message_id,
             source_kind="google_drive",
+            operation_id=operation_id,
         )
         await show_upload_header_selection(context, settings, job, status_message)
     except DriveAccessDenied as exc:
         temporary_path.unlink(missing_ok=True)
+        LOGGER.warning(
+            "operation=drive_upload operation_id=%s stage=access_denied error_type=%s user_id=%s",
+            operation_id, type(exc).__name__, update.effective_user.id,
+        )
         await status_message.edit_text(
-            "به فایل دسترسی ندارم. در Google Drive، بخش اشتراک‌گذاری را روی «هرکسی که لینک را دارد — مشاهده‌گر» بگذارید و لینک جدید را بفرستید. "
-            "فایل خصوصی با روش فعلی قابل دریافت نیست."
+            progress_text(
+                "❌ دسترسی به فایل Drive ممکن نیست",
+                "مرحلهٔ بررسی دسترسی فایل",
+                100,
+                operation_id=operation_id,
+                detail=(
+                    "در Google Drive، اشتراک‌گذاری را روی «هرکسی که لینک را دارد — مشاهده‌گر» بگذارید. "
+                    "فایل خصوصی با روش فعلی قابل دریافت نیست."
+                ),
+            )
         )
     except DriveFileTooLarge as exc:
         temporary_path.unlink(missing_ok=True)
         await status_message.edit_text(
-            f"حجم فایل ({_human_bytes(exc.actual)}) از سقف تنظیم‌شده ({_human_bytes(exc.maximum)}) بیشتر است."
+            progress_text(
+                "❌ حجم فایل بیش از سقف مجاز است",
+                "مرحلهٔ بررسی اندازهٔ فایل",
+                100,
+                operation_id=operation_id,
+                detail=f"حجم: {_human_bytes(exc.actual)}؛ سقف: {_human_bytes(exc.maximum)}",
+            )
         )
     except DriveInsufficientSpace as exc:
         temporary_path.unlink(missing_ok=True)
         await status_message.edit_text(
-            f"فضای آزاد دیسک برای دریافت فایل کافی نیست؛ فایل {_human_bytes(exc.required)} و فضای آزاد {_human_bytes(exc.available)} است."
+            progress_text(
+                "❌ فضای دیسک کافی نیست",
+                "مرحلهٔ بررسی فضای آزاد",
+                100,
+                operation_id=operation_id,
+                detail=f"حجم فایل: {_human_bytes(exc.required)}؛ فضای آزاد: {_human_bytes(exc.available)}",
+            )
         )
-    except DriveNotCsv:
+    except DriveNotCsv as exc:
         temporary_path.unlink(missing_ok=True)
-        await status_message.edit_text("این لینک به فایل CSV یا TXT نمی‌رسد. فایل‌های Google Sheets/Docs را ابتدا به CSV تبدیل کنید.")
-    except DriveDownloadError:
+        LOGGER.warning(
+            "operation=drive_upload operation_id=%s stage=unsupported_file_type error_type=%s",
+            operation_id, type(exc).__name__,
+        )
+        await status_message.edit_text(progress_text(
+            "❌ نوع فایل پشتیبانی نمی‌شود",
+            "مرحلهٔ بررسی نوع فایل",
+            100,
+            operation_id=operation_id,
+            detail="این لینک به CSV یا TXT نمی‌رسد؛ Google Sheets/Docs را ابتدا به CSV تبدیل کنید.",
+        ))
+    except DriveDownloadError as exc:
         temporary_path.unlink(missing_ok=True)
-        LOGGER.warning("Google Drive download failed user_id=%s", update.effective_user.id)
-        await status_message.edit_text("دریافت فایل از Google Drive ناموفق بود؛ دسترسی، لینک و اتصال اینترنت را بررسی کنید.")
+        LOGGER.warning(
+            "operation=drive_upload operation_id=%s stage=download_failed error_type=%s user_id=%s",
+            operation_id, type(exc).__name__, update.effective_user.id,
+        )
+        await status_message.edit_text(progress_text(
+            "❌ دریافت فایل از Google Drive ناموفق بود",
+            "مرحلهٔ دانلود Drive",
+            100,
+            operation_id=operation_id,
+            detail="دسترسی، لینک و اتصال اینترنت را بررسی کنید.",
+        ))
     except Exception as exc:
         temporary_path.unlink(missing_ok=True)
-        LOGGER.error("Unexpected Google Drive download error user_id=%s error_type=%s", update.effective_user.id, type(exc).__name__)
-        await status_message.edit_text("دریافت فایل از Google Drive ناموفق بود؛ فایل ناقص حذف شد و ورود اطلاعات آغاز نشد.")
+        _log_exception_redacted(
+            "operation=drive_upload operation_id=%s stage=unexpected_failure user_id=%s error_type=%s"
+            % (operation_id, update.effective_user.id, type(exc).__name__),
+            exc,
+            reference.file_id,
+            reference.resource_key,
+        )
+        await status_message.edit_text(progress_text(
+            "❌ دریافت فایل از Google Drive ناموفق بود",
+            "جزئیات و traceback در CMD ثبت شد",
+            100,
+            operation_id=operation_id,
+            detail="فایل ناقص حذف شد و ورود اطلاعات آغاز نشد.",
+        ))
     finally:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        context.user_data.pop("active_operation_id", None)
 
 
 async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1092,13 +1483,27 @@ async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT
     settings.data_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = safe_upload_path(settings.data_directory, "drive_upload.csv", source_prefix="drive")
     context.user_data[UPLOAD_TRANSFER_KEY] = "google_drive"
+    operation_id = new_operation_id()
+    context.user_data["active_operation_id"] = operation_id
+    LOGGER.info(
+        "operation=drive_upload operation_id=%s stage=link_accepted user_id=%s",
+        operation_id, update.effective_user.id,
+    )
     try:
-        status_message = await message.reply_text("🔎 لینک بررسی شد؛ در حال دریافت فایل از Google Drive…")
+        status_message = await message.reply_text(progress_text(
+            "🔎 لینک Drive بررسی شد",
+            "آماده‌سازی دانلود",
+            0,
+            operation_id=operation_id,
+        ))
     except Exception:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        context.user_data.pop("active_operation_id", None)
         raise
     context.application.create_task(
-        _download_drive_upload(update, context, settings, reference, temporary_path, status_message),
+        _download_drive_upload(
+            update, context, settings, reference, temporary_path, status_message, operation_id
+        ),
         update=update,
         name="google-drive-csv-download",
     )
@@ -1240,15 +1645,29 @@ def _database_file_view(
     return text, keyboard
 
 
-def _archive_and_delete_database_file(settings: Settings, file_id: int):
+def _archive_and_delete_database_file(
+    settings: Settings,
+    file_id: int,
+    progress_callback: Callable[[str, float], None] | None = None,
+):
     """Remove the index and move its source CSV outside DATA_DIRECTORY, not delete it."""
+    def report(stage: str, percent: float) -> None:
+        if progress_callback:
+            try:
+                progress_callback(stage, percent)
+            except Exception:
+                LOGGER.exception("operation=database_delete stage=progress_callback_failed file_id=%s", file_id)
+
+    report("در حال بازکردن پایگاه‌داده", 0.0)
     connection = connect(settings.database_path)
     source_path: Path | None = None
     archived_path: Path | None = None
     try:
         row = get_imported_file_details(connection, file_id)
         if row is None:
+            report("فایل در پایگاه‌داده پیدا نشد", 100.0)
             return None
+        report("بررسی وضعیت و مسیر فایل", 15.0)
         if str(row["status"]) != "completed":
             raise ValueError("Only completed imports can be removed from the database.")
 
@@ -1273,9 +1692,11 @@ def _archive_and_delete_database_file(settings: Settings, file_id: int):
                     f"{archived_path.stem}_{secrets.token_hex(4)}{archived_path.suffix}"
                 )
             archived_path.parent.mkdir(parents=True, exist_ok=True)
+            report("انتقال CSV خام به آرشیو امن", 40.0)
             shutil.move(str(source_path), str(archived_path))
 
         try:
+            report("حذف ردیف‌ها و شاخص‌های این فایل از SQLite", 65.0)
             result = delete_imported_file(connection, file_id)
             if result is None:
                 raise RuntimeError("The imported file disappeared before deletion completed.")
@@ -1284,6 +1705,7 @@ def _archive_and_delete_database_file(settings: Settings, file_id: int):
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(archived_path), str(source_path))
             raise
+        report("حذف دیتاست کامل شد", 100.0)
         return result, archived_path
     finally:
         connection.close()
@@ -1366,20 +1788,96 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
         return
 
     if action == "delete":
-        await callback.answer("در حال حذف از پایگاه‌داده و انتقال CSV خام به آرشیو…")
+        operation_id = new_operation_id()
+        context.user_data["active_operation_id"] = operation_id
+        LOGGER.info(
+            "operation=database_delete operation_id=%s stage=started user_id=%s file_id=%s",
+            operation_id, update.effective_user.id, file_id,
+        )
+        await callback.answer("حذف دیتاست آغاز شد.")
+        await callback.edit_message_text(progress_text(
+            "🗑️ حذف دیتاست",
+            "آماده‌سازی حذف و آرشیو فایل خام",
+            0,
+            operation_id=operation_id,
+        ))
+        loop = asyncio.get_running_loop()
+        progress_queue: asyncio.Queue[tuple[str, float] | None] = asyncio.Queue()
+
+        def delete_progress(stage: str, percent: float) -> None:
+            stage_code = {
+                "در حال بازکردن پایگاه‌داده": "open_database",
+                "فایل در پایگاه‌داده پیدا نشد": "file_not_found",
+                "بررسی وضعیت و مسیر فایل": "validate_source",
+                "انتقال CSV خام به آرشیو امن": "archive_source",
+                "حذف ردیف‌ها و شاخص‌های این فایل از SQLite": "delete_records",
+                "حذف دیتاست کامل شد": "delete_complete",
+            }.get(stage, "delete_progress")
+            LOGGER.info(
+                "operation=database_delete operation_id=%s stage=%s progress=%.1f file_id=%s",
+                operation_id, stage_code, percent, file_id,
+            )
+            loop.call_soon_threadsafe(progress_queue.put_nowait, (stage, percent))
+
+        async def consume_delete_progress() -> None:
+            while True:
+                item = await progress_queue.get()
+                if item is None:
+                    return
+                stage, percent = item
+                try:
+                    await callback.edit_message_text(progress_text(
+                        "🗑️ حذف دیتاست",
+                        stage,
+                        percent,
+                        operation_id=operation_id,
+                    ))
+                except Exception:
+                    LOGGER.exception(
+                        "operation=database_delete operation_id=%s stage=progress_message_failed",
+                        operation_id,
+                    )
+
+        progress_task = asyncio.create_task(consume_delete_progress(), name=f"delete-progress-{operation_id}")
+        delete_error: Exception | None = None
+        result = None
         try:
-            result = await asyncio.to_thread(_archive_and_delete_database_file, settings, file_id)
-        except Exception:
-            LOGGER.exception("Failed to delete imported database file file_id=%s", file_id)
+            result = await asyncio.to_thread(
+                _archive_and_delete_database_file, settings, file_id, delete_progress
+            )
+        except Exception as exc:
+            delete_error = exc
+        finally:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+            await progress_task
+            context.user_data.pop("active_operation_id", None)
+        if delete_error is not None:
+            _log_exception_redacted(
+                "operation=database_delete operation_id=%s stage=failed file_id=%s error_type=%s"
+                % (operation_id, file_id, type(delete_error).__name__),
+                delete_error,
+                settings.telegram_bot_token,
+            )
             await callback.edit_message_text(
-                "❌ حذف انجام نشد. اطلاعات پایگاه‌داده دست‌نخورده مانده یا فایل خام به مسیر اصلی بازگردانده شده است.",
+                progress_text(
+                    "❌ حذف انجام نشد",
+                    "اطلاعات دیتابیس بررسی و در صورت نیاز CSV بازگردانده شد",
+                    100,
+                    operation_id=operation_id,
+                    detail="جزئیات فنی در CMD ثبت شده است.",
+                ),
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("بازگشت به فهرست", callback_data=f"db:list:{page}")
                 ]]),
             )
             return
         if result is None:
-            await callback.edit_message_text("این فایل دیگر در پایگاه‌داده نیست.")
+            await callback.edit_message_text(progress_text(
+                "⚪ فایل دیگر در پایگاه‌داده نیست",
+                "عملیات پایان یافت",
+                100,
+                operation_id=operation_id,
+            ))
             return
         deleted, archived_path = result
         LOGGER.info(
@@ -1394,7 +1892,19 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
         else:
             notice += "\nفایل خام پیدا نشد؛ فقط اطلاعات پایگاه‌داده حذف شد."
         text, keyboard = _database_list_view(settings, page)
-        await callback.edit_message_text(f"{notice}\n\n{text}", reply_markup=keyboard)
+        LOGGER.info(
+            "operation=database_delete operation_id=%s stage=complete file_id=%s deleted_rows=%s",
+            operation_id, file_id, deleted["record_count"],
+        )
+        await callback.edit_message_text(
+            progress_text(
+                "✅ حذف دیتاست کامل شد",
+                "فایل خام در آرشیو نگه‌داری شد و از نتایج حذف شد",
+                100,
+                operation_id=operation_id,
+            ) + f"\n\n{notice}\n\n{text}",
+            reply_markup=keyboard,
+        )
 
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1573,15 +2083,50 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
+    operation_id = new_operation_id()
+    context.user_data["active_operation_id"] = operation_id
+    LOGGER.info(
+        "operation=stats operation_id=%s stage=started user_id=%s",
+        operation_id, update.effective_user.id,
+    )
+    status = await update.effective_message.reply_text(progress_text(
+        "📊 دریافت آمار پایگاه‌داده",
+        "آماده‌سازی خواندن آمار",
+        0,
+        operation_id=operation_id,
+    ))
     try:
+        await status.edit_text(progress_text(
+            "📊 دریافت آمار پایگاه‌داده",
+            "در حال خواندن وضعیت و اندازهٔ دیتابیس",
+            50,
+            operation_id=operation_id,
+        ))
         statistics = await asyncio.to_thread(run_stats, settings)
-    except Exception:
-        LOGGER.exception("Stats request failed for user id=%s", update.effective_user.id)
-        await update.effective_message.reply_text("آمار موقتاً در دسترس نیست.")
+    except Exception as exc:
+        _log_exception_redacted(
+            "operation=stats operation_id=%s stage=failed user_id=%s error_type=%s"
+            % (operation_id, update.effective_user.id, type(exc).__name__),
+            exc,
+            settings.telegram_bot_token,
+        )
+        await status.edit_text(progress_text(
+            "❌ دریافت آمار ناموفق بود",
+            "جزئیات در CMD ثبت شد",
+            100,
+            operation_id=operation_id,
+        ))
+        context.user_data.pop("active_operation_id", None)
         return
     size_mib = float(statistics["database_bytes"]) / (1024 * 1024)
-    await update.effective_message.reply_text(
-        "<b>آمار پایگاه داده</b>\n"
+    LOGGER.info(
+        "operation=stats operation_id=%s stage=complete records=%s completed_files=%s failed_files=%s database_bytes=%s",
+        operation_id, statistics["records"], statistics["completed_files"],
+        statistics["failed_files"], statistics["database_bytes"],
+    )
+    await status.edit_text(
+        progress_text("✅ آمار آماده شد", "پایان", 100, operation_id=operation_id)
+        + "\n\n<b>آمار پایگاه داده</b>\n"
         f"تعداد کل ردیف‌ها: {statistics['records']:,}\n"
         f"فایل‌های کامل‌شده: {statistics['completed_files']:,}\n"
         f"در حال پردازش: {statistics['importing_files']:,}\n"
@@ -1591,6 +2136,51 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"ستون‌های جست‌وجو: ستون‌های انتخاب‌شده‌ی هر فایل\n"
         f"شاخص‌های جست‌وجو آماده‌اند: {'بله' if statistics['search_indexes_ready'] else 'خیر'}",
         parse_mode=ParseMode.HTML,
+    )
+    context.user_data.pop("active_operation_id", None)
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Capture unhandled update/task failures with enough context to diagnose them."""
+    error = context.error
+    if error is None:
+        return
+    settings = context.application.bot_data.get("settings")
+    user_data = getattr(context, "user_data", None)
+    operation_id = user_data.get("active_operation_id", "-") if isinstance(user_data, dict) else "-"
+    effective_user = getattr(update, "effective_user", None)
+    effective_chat = getattr(update, "effective_chat", None)
+    update_id = getattr(update, "update_id", "-")
+    user_id = getattr(effective_user, "id", "-")
+    chat_id = getattr(effective_chat, "id", "-")
+    _log_exception_redacted(
+        "operation=telegram_update operation_id=%s stage=unhandled_exception update_id=%s user_id=%s chat_id=%s error_type=%s"
+        % (operation_id, update_id, user_id, chat_id, type(error).__name__),
+        error,
+        getattr(settings, "telegram_bot_token", None),
+    )
+
+
+async def log_update_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.effective_message
+    LOGGER.info(
+        "operation=telegram_update stage=received update_id=%s user_id=%s chat_id=%s chat_type=%s update_kind=%s",
+        update.update_id,
+        getattr(user, "id", "-"),
+        getattr(chat, "id", "-"),
+        getattr(chat, "type", "-"),
+        "document" if message and message.document else "text" if message and message.text else "callback" if update.callback_query else "other",
+    )
+
+
+async def log_update_completed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    LOGGER.info(
+        "operation=telegram_update stage=handler_completed update_id=%s user_id=%s chat_id=%s",
+        update.update_id, getattr(user, "id", "-"), getattr(chat, "id", "-"),
     )
 
 
@@ -1611,58 +2201,120 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await callback.answer("این صفحه‌ی نتیجه منقضی شده است؛ دوباره جست‌وجو کنید.", show_alert=True)
         return
     await callback.answer()
+    operation_id = new_operation_id()
+    context.user_data["active_operation_id"] = operation_id
+    LOGGER.info(
+        "operation=pagination operation_id=%s stage=started user_id=%s page=%d query_length=%d",
+        operation_id, update.effective_user.id, page + 1, len(session.query),
+    )
+    await callback.edit_message_text(progress_text(
+        "📄 صفحه‌بندی نتیجه‌ها",
+        "آماده‌سازی صفحهٔ بعد",
+        0,
+        operation_id=operation_id,
+    ))
     try:
+        await callback.edit_message_text(progress_text(
+            "📄 صفحه‌بندی نتیجه‌ها",
+            "در حال جست‌وجوی صفحه در دیتابیس",
+            35,
+            operation_id=operation_id,
+        ))
         result = await asyncio.to_thread(run_search, settings, session.query, page)
-    except Exception:
-        LOGGER.exception("Pagination search failed for user id=%s", update.effective_user.id)
-        await callback.edit_message_text("جست‌وجو موقتاً در دسترس نیست؛ دوباره تلاش کنید.")
+    except Exception as exc:
+        _log_exception_redacted(
+            "operation=pagination operation_id=%s stage=search_failed user_id=%s page=%d error_type=%s"
+            % (operation_id, update.effective_user.id, page + 1, type(exc).__name__),
+            exc,
+            settings.telegram_bot_token,
+        )
+        await callback.edit_message_text(progress_text(
+            "❌ بارگذاری صفحه ناموفق بود",
+            "جزئیات در CMD ثبت شد",
+            100,
+            operation_id=operation_id,
+        ))
+        context.user_data.pop("active_operation_id", None)
         return
     visible_total = min(result.total_count, settings.max_results)
     if not result.rows or page * settings.results_per_page >= visible_total:
         await callback.answer("نتیجه‌ی دیگری نیست.", show_alert=True)
+        context.user_data.pop("active_operation_id", None)
         return
     needs_full_csv = page_needs_full_csv(result, settings)
+    LOGGER.info(
+        "operation=pagination operation_id=%s stage=query_complete page=%d results=%d full_csv=%s",
+        operation_id, page + 1, len(result.rows), needs_full_csv,
+    )
     await callback.edit_message_text(
-        format_page(session.query, page, result, settings, full_csv_attached=needs_full_csv),
+        progress_text("✅ صفحه آماده شد", "در حال نمایش نتیجه‌ها", 100, operation_id=operation_id)
+        + "\n\n"
+        + format_page(session.query, page, result, settings, full_csv_attached=needs_full_csv),
         parse_mode=ParseMode.HTML,
         reply_markup=pagination_keyboard(token, page, result.total_count, settings),
         disable_web_page_preview=True,
     )
     if needs_full_csv:
+        LOGGER.info(
+            "operation=pagination operation_id=%s stage=full_csv_send_started page=%d",
+            operation_id, page + 1,
+        )
         await context.bot.send_document(
             chat_id=callback.message.chat_id,
             document=io.BytesIO(full_results_csv_bytes(session.query, page, result)),
             filename=f"نتایج_جست‌وجو_{page + 1}.csv",
             caption="همه‌ی فیلدهای اصلی ردیف‌های نتیجه.",
         )
+        LOGGER.info(
+            "operation=pagination operation_id=%s stage=full_csv_send_complete page=%d",
+            operation_id, page + 1,
+        )
+    context.user_data.pop("active_operation_id", None)
 
 
 def main() -> None:
+    global LOGGER
     instance_lock = None
     try:
         settings = load_settings()
+        LOGGER = configure_logging(
+            settings.log_directory,
+            "bot.log",
+            settings.log_level,
+            secrets_to_redact=(settings.telegram_bot_token,),
+        )
+        LOGGER.info("operation=startup stage=settings_loaded")
         settings.validate_for_bot()
+        LOGGER.info("operation=startup stage=settings_validated")
         try:
             instance_lock = acquire_instance_lock(
                 settings.data_directory / ".telegram-csv-search.lock"
             )
         except BotInstanceAlreadyRunning as exc:
+            LOGGER.error("operation=startup stage=instance_lock_failed detail=%s", exc)
             raise SystemExit(str(exc)) from exc
+        LOGGER.info("operation=startup stage=instance_lock_acquired")
         # A fresh Railway/container deployment may not have a CSV or database yet.
         # Create the empty schema first so the bot can start and receive its first
         # CSV through Telegram upload or the configured Google Drive link flow.
+        LOGGER.info("operation=startup stage=database_bootstrap_started path=%s", settings.database_path)
         connection = connect(settings.database_path)
         try:
             initialize_database(connection)
             initialize_access_control(connection, settings)
         finally:
             connection.close()
+        LOGGER.info("operation=startup stage=database_bootstrap_complete")
     except ConfigurationError as exc:
+        if LOGGER.handlers:
+            LOGGER.error("operation=startup stage=configuration_failed error=%s", exc)
         raise SystemExit(f"Configuration error: {exc}")
-    global LOGGER
-    LOGGER = configure_logging(settings.log_directory, "bot.log", settings.log_level)
+    except Exception:
+        if LOGGER.handlers:
+            LOGGER.exception("operation=startup stage=failed")
+        raise
     LOGGER.info(
-        "Bot starting; bootstrap user count=%d admin count=%d",
+        "operation=startup stage=bot_starting bootstrap_user_count=%d admin_count=%d",
         len(settings.allowed_user_ids), len(settings.admin_user_ids),
     )
 
@@ -1673,9 +2325,11 @@ def main() -> None:
         .base_file_url(settings.telegram_file_base_url)
         .build()
     )
+    LOGGER.info("operation=startup stage=application_built")
     application.bot_data["settings"] = settings
     manager = UploadManager(settings, application.bot)
     application.bot_data["upload_manager"] = manager
+    application.add_handler(TypeHandler(Update, log_update_received), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
@@ -1701,20 +2355,30 @@ def main() -> None:
         google_drive_link_upload,
     ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
+    application.add_error_handler(telegram_error_handler)
+    application.add_handler(TypeHandler(Update, log_update_completed), group=100)
+    LOGGER.info("operation=startup stage=handlers_registered")
 
     async def post_init(app: Application) -> None:
+        LOGGER.info("operation=startup stage=post_init_started")
         await manager.start()
+        LOGGER.info("operation=startup stage=upload_manager_started")
 
     async def post_shutdown(app: Application) -> None:
+        LOGGER.info("operation=shutdown stage=upload_manager_stopping")
         await manager.stop()
+        LOGGER.info("operation=shutdown stage=upload_manager_stopped")
 
     application.post_init = post_init
     application.post_shutdown = post_shutdown
     try:
+        LOGGER.info("operation=startup stage=polling_starting")
         application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+        LOGGER.info("operation=shutdown stage=polling_stopped")
     finally:
         if instance_lock is not None:
             instance_lock.close()
+            LOGGER.info("operation=shutdown stage=instance_lock_released")
 
 
 if __name__ == "__main__":

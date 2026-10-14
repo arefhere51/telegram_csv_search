@@ -8,7 +8,7 @@ from pathlib import Path
 import logging
 import sqlite3
 import time
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 from config import Settings
 
@@ -320,9 +320,26 @@ def search_indexes_ready(connection: sqlite3.Connection) -> bool:
     return get_metadata(connection, "search_indexes_ready") == "1"
 
 
-def build_search_indexes(connection: sqlite3.Connection, *, force: bool = False) -> None:
+def build_search_indexes(
+    connection: sqlite3.Connection,
+    *,
+    force: bool = False,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> None:
     """Build exact/prefix B-tree indexes and rebuild FTS after an initial bulk import."""
+    original_progress_callback = progress_callback
+
+    def progress_callback(stage: str, percent: float) -> None:
+        if original_progress_callback is None:
+            return
+        try:
+            original_progress_callback(stage, percent)
+        except Exception:
+            LOGGER.exception("Index progress callback failed")
+
     if search_indexes_ready(connection) and not force:
+        if progress_callback:
+            progress_callback("شاخص‌ها از قبل آماده‌اند", 100.0)
         return
     index_statements = (
         "CREATE INDEX IF NOT EXISTS idx_records_phone_norm ON records(phone_norm)",
@@ -334,19 +351,61 @@ def build_search_indexes(connection: sqlite3.Connection, *, force: bool = False)
     )
     for attempt in range(INDEX_BUILD_RETRIES):
         try:
+            if progress_callback:
+                progress_callback("انتظار برای آزادشدن پایگاه‌داده", 0.0)
             # Acquire SQLite's single-writer slot before doing the expensive FTS rebuild.
             # Re-check after acquiring it so concurrent initializers do not rebuild twice.
             connection.execute("BEGIN IMMEDIATE")
             if search_indexes_ready(connection) and not force:
                 connection.commit()
+                if progress_callback:
+                    progress_callback("شاخص‌ها توسط فرایند دیگری آماده شدند", 100.0)
                 return
-            connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
-            for statement in index_statements:
+            if progress_callback:
+                progress_callback("قفل نوشتن گرفته شد؛ آماده‌سازی FTS", 5.0)
+            record_count = int(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+            changes_before_rebuild = connection.total_changes
+            last_fts_percent = 5.0
+
+            def report_fts_progress() -> int:
+                nonlocal last_fts_percent
+                if progress_callback and record_count:
+                    changed = max(0, connection.total_changes - changes_before_rebuild)
+                    # SQLite's total_changes is a useful approximation for FTS5 rebuild work.
+                    # Clamp it below completion; the statement's return is the authoritative end.
+                    percent = min(50.0, 5.0 + 45.0 * changed / record_count)
+                    if percent >= last_fts_percent + 2.0:
+                        last_fts_percent = percent
+                        progress_callback("بازسازی شاخص متنی FTS", percent)
+                return 0
+
+            if progress_callback:
+                progress_callback("بازسازی شاخص متنی FTS", 5.0)
+            connection.set_progress_handler(report_fts_progress, 20_000)
+            try:
+                connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
+            finally:
+                connection.set_progress_handler(None, 0)
+            if progress_callback:
+                progress_callback("بازسازی شاخص متنی FTS کامل شد", 52.0)
+            for index_number, statement in enumerate(index_statements):
+                index_name = statement.split()[5]
+                start_percent = 52.0 + index_number * 6.0
+                if progress_callback:
+                    progress_callback(f"ساخت شاخص {index_name}", start_percent)
                 connection.execute(statement)
+                if progress_callback:
+                    progress_callback(f"شاخص {index_name} ساخته شد", start_percent + 6.0)
             if force:
+                if progress_callback:
+                    progress_callback("بازسازی نهایی شاخص‌های B-tree", 90.0)
                 connection.execute("REINDEX")
+                if progress_callback:
+                    progress_callback("بازسازی نهایی B-tree کامل شد", 97.0)
             set_metadata(connection, "search_indexes_ready", "1")
             connection.commit()
+            if progress_callback:
+                progress_callback("ساخت همهٔ شاخص‌ها کامل شد", 100.0)
             return
         except sqlite3.OperationalError as exc:
             connection.rollback()
@@ -359,6 +418,11 @@ def build_search_indexes(connection: sqlite3.Connection, *, force: bool = False)
                 "SQLite remained busy while building search indexes; retry=%d/%d delay_seconds=%d",
                 attempt + 1, INDEX_BUILD_RETRIES, delay,
             )
+            if progress_callback:
+                progress_callback(
+                    f"قفل موقت SQLite؛ تلاش دوباره {attempt + 2} از {INDEX_BUILD_RETRIES}",
+                    0.0,
+                )
             time.sleep(delay)
 
 

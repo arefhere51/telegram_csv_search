@@ -14,7 +14,7 @@ class FakeStatus:
     def __init__(self) -> None:
         self.edits: list[str] = []
 
-    async def edit_text(self, text: str) -> None:
+    async def edit_text(self, text: str, **kwargs) -> None:
         self.edits.append(text)
 
 
@@ -54,11 +54,15 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             effective_user=SimpleNamespace(id=456),
         )
         self.context = SimpleNamespace(bot=self.fake_bot)
-        self.settings = SimpleNamespace(max_query_length=160)
+        self.settings = SimpleNamespace(max_query_length=160, telegram_bot_token="")
 
     def _exporter(self, settings, query, destination, aliases, *, filename_prefix, **kwargs):
         path = Path(destination) / f"{filename_prefix}.txt"
         path.write_text("━━━━━━━━━━━━━━━━━━\nFULL_NAME: مجید\n", encoding="utf-8")
+        callback = kwargs.get("progress_callback")
+        if callback:
+            callback(0, 1)
+            callback(1, 1)
         return [path]
 
     async def test_more_than_five_sends_only_named_txt_with_count_and_30s_timeout(self) -> None:
@@ -81,7 +85,8 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["read_timeout"], 30)
         self.assertEqual(sent["write_timeout"], 30)
         self.assertTrue(any("در حال ارسال" in text for text in self.message.status.edits))
-        self.assertTrue(any("ارسال همهٔ فایل‌های نتیجه کامل شد" in text for text in self.message.status.edits))
+        self.assertTrue(any("جست‌وجو و ارسال کامل شد" in text for text in self.message.status.edits))
+        self.assertTrue(any("100.0%" in text for text in self.message.status.edits))
 
     async def test_five_results_are_shown_in_chat_without_txt_upload(self) -> None:
         result = SimpleNamespace(total_count=5, mode="text", rows=[])
@@ -93,7 +98,8 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.respond_to_search(self.update, self.context, self.settings, "مجید")
 
-        self.assertEqual(self.message.replies[0][0], "همهٔ پنج نتیجه")
+        self.assertIn("در حال آماده‌سازی", self.message.replies[0][0])
+        self.assertTrue(any("همهٔ پنج نتیجه" in text for text in self.message.status.edits))
         self.assertEqual(len(self.message.replies), 1)
         self.assertEqual(self.fake_bot.documents, [])
         exporter.assert_not_called()
@@ -113,7 +119,7 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.respond_to_search(self.update, self.context, self.settings, "مجید")
 
         self.assertTrue(any("در حال ارسال" in text for text in self.message.status.edits))
-        self.assertTrue(any("ارسال فایل تا ۳۰ ثانیه کامل نشد" in text for text in self.message.status.edits))
+        self.assertTrue(any("مهلت ارسال ۳۰ ثانیه‌ای" in text for text in self.message.status.edits))
 
     async def test_wait_for_cancels_a_stalled_send_after_configured_deadline(self) -> None:
         result = SimpleNamespace(total_count=9, mode="text", rows=[])
@@ -131,7 +137,26 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.respond_to_search(self.update, self.context, self.settings, "مجید")
 
         self.assertTrue(any("در حال ارسال" in text for text in self.message.status.edits))
-        self.assertTrue(any("ارسال فایل تا ۳۰ ثانیه کامل نشد" in text for text in self.message.status.edits))
+        self.assertTrue(any("مهلت ارسال ۳۰ ثانیه‌ای" in text for text in self.message.status.edits))
+
+    async def test_export_error_is_not_overwritten_by_queued_progress(self) -> None:
+        result = SimpleNamespace(total_count=9, mode="text", rows=[])
+
+        def failing_exporter(settings, query, destination, aliases, *, filename_prefix, **kwargs):
+            callback = kwargs.get("progress_callback")
+            if callback:
+                callback(2, 9)
+            raise RuntimeError("simulated export failure")
+
+        with (
+            patch("bot.run_search", return_value=result),
+            patch("bot.load_display_header_aliases", return_value={}),
+            patch("bot.write_search_text_exports", side_effect=failing_exporter),
+        ):
+            await bot.respond_to_search(self.update, self.context, self.settings, "مجید")
+
+        self.assertIn("ساخت یا ارسال فایل نتیجه‌ها ناموفق بود", self.message.status.edits[-1])
+        self.assertIn("100.0%", self.message.status.edits[-1])
 
 
 if __name__ == "__main__":

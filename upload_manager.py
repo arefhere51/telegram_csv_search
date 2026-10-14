@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from telegram import Bot
 from telegram.error import BadRequest
@@ -16,6 +16,7 @@ from telegram.error import BadRequest
 from config import Settings
 from database import build_search_indexes, connect, initialize_database, seed_dedupe_hashes
 from import_csv import import_one_file
+from progress_utils import new_operation_id, progress_text
 
 LOGGER = logging.getLogger("telegram_csv_search")
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -33,6 +34,7 @@ class UploadJob:
     status_message_id: int | None = None
     selected_column_indices: tuple[int, ...] | None = None
     source_kind: str = "telegram"
+    operation_id: str | None = None
 
 
 class UploadManager:
@@ -80,9 +82,17 @@ class UploadManager:
             f"حجم: {size}\nسرعت: {_format_bytes(speed)} در ثانیه"
         )
 
-    def _format_import(self, message: str) -> str:
+    def _format_import(self, message: str, operation_id: str | None = None) -> str:
         # import_csv emits a stable human-readable line with progress, rows and speed.
-        return f"📥 ورود اطلاعات فایل\n{message}"
+        match = re.search(r"پیشرفت:\s*([0-9]+(?:\.[0-9]+)?)%", message)
+        percent = float(match.group(1)) if match else 0.0
+        return progress_text(
+            "📥 ورود اطلاعات فایل",
+            "خواندن CSV و ثبت ردیف‌ها",
+            percent,
+            operation_id=operation_id,
+            detail=message,
+        )
 
     async def _edit_status(self, job: UploadJob, text: str) -> None:
         if not job.status_message_id:
@@ -114,15 +124,58 @@ class UploadManager:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOGGER.exception("Unhandled upload worker error filename=%s", job.original_filename)
-                await self._status(job.chat_id, f"ورود فایل {job.original_filename} ناموفق بود؛ فایل روی سرور نگه داشته شد.")
+                LOGGER.exception(
+                    "operation=upload operation_id=%s stage=worker_unhandled filename=%s",
+                    job.operation_id or "-", job.original_filename,
+                )
+                await self._edit_status(
+                    job,
+                    progress_text(
+                        "❌ پردازش فایل ناموفق بود",
+                        "خطای مدیریت‌نشده؛ جزئیات در CMD ثبت شد",
+                        100,
+                        operation_id=job.operation_id,
+                        detail=f"{job.original_filename}؛ فایل روی سرور نگه داشته شد.",
+                    ),
+                )
             finally:
                 self.queue.task_done()
 
     async def _process(self, job: UploadJob, position: int) -> None:
-        await self._edit_status(job, f"⏳ در صف ورود اطلاعات\n{job.original_filename}\nموقعیت در صف: {position}")
+        operation_id = job.operation_id or new_operation_id()
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=queued user_id=%s filename=%s queue_position=%d bytes=%s",
+            operation_id, job.uploader_id, job.original_filename, position, job.file_size,
+        )
+        await self._edit_status(
+            job,
+            progress_text(
+                "📥 آماده‌سازی فایل",
+                f"در صف ورود اطلاعات؛ موقعیت {position}",
+                0,
+                operation_id=operation_id,
+                detail=job.original_filename,
+            ),
+        )
         loop = asyncio.get_running_loop()
         last_status = 0.0
+        pending_status_updates: list[tuple[str, Any]] = []
+
+        async def flush_progress_updates() -> None:
+            pending = list(pending_status_updates)
+            pending_status_updates.clear()
+            if not pending:
+                return
+            results = await asyncio.gather(
+                *(asyncio.wrap_future(future) for _, future in pending),
+                return_exceptions=True,
+            )
+            for (stage_name, _), result in zip(pending, results):
+                if isinstance(result, BaseException):
+                    LOGGER.error(
+                        "operation=upload operation_id=%s stage=progress_update_failed progress_stage=%s error_type=%s",
+                        operation_id, stage_name, type(result).__name__,
+                    )
 
         def progress(message: str) -> None:
             nonlocal last_status
@@ -130,10 +183,62 @@ class UploadManager:
             if now - last_status < self.settings.upload_progress_interval_seconds:
                 return
             last_status = now
-            future = asyncio.run_coroutine_threadsafe(
-                self._edit_status(job, self._format_import(message)), loop
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._edit_status(job, self._format_import(message, operation_id)), loop
+                )
+            except RuntimeError:
+                LOGGER.exception(
+                    "operation=upload operation_id=%s stage=import_progress_loop_unavailable",
+                    operation_id,
+                )
+                return
+            pending_status_updates.append(("csv_import_progress", future))
+
+        def index_progress(stage: str, percent: float) -> None:
+            if stage.startswith("ساخت شاخص "):
+                stage_code = "btree_index_build"
+                index_name = stage.removeprefix("ساخت شاخص ")
+            elif stage.startswith("شاخص ") and " ساخته شد" in stage:
+                stage_code = "btree_index_complete"
+                index_name = stage.removeprefix("شاخص ").removesuffix(" ساخته شد")
+            elif "FTS" in stage:
+                stage_code = "fts_rebuild"
+                index_name = "records_all_fts"
+            elif "قفل" in stage:
+                stage_code = "sqlite_lock_wait"
+                index_name = "-"
+            elif "کامل" in stage or "آماده" in stage:
+                stage_code = "index_build_complete"
+                index_name = "-"
+            else:
+                stage_code = "index_preparation"
+                index_name = "-"
+            LOGGER.info(
+                "operation=upload operation_id=%s stage=%s index=%s progress=%.1f filename=%s",
+                operation_id, stage_code, index_name, percent, job.original_filename,
             )
-            future.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._edit_status(
+                        job,
+                        progress_text(
+                            "🧱 آماده‌سازی شاخص جست‌وجو",
+                            stage,
+                            percent,
+                            operation_id=operation_id,
+                            detail=job.original_filename,
+                        ),
+                    ),
+                    loop,
+                )
+            except RuntimeError:
+                LOGGER.exception(
+                    "operation=upload operation_id=%s stage=index_progress_loop_unavailable",
+                    operation_id,
+                )
+                return
+            pending_status_updates.append((stage_code, future))
 
         metadata = None
         if job.source_kind == "telegram":
@@ -157,6 +262,7 @@ class UploadManager:
                     telegram_metadata=metadata,
                     progress_callback=progress,
                     selected_column_indices=job.selected_column_indices,
+                    operation_id=operation_id,
                 )
                 return processed, inserted
             finally:
@@ -166,38 +272,77 @@ class UploadManager:
             connection = connect(self.settings.database_path)
             try:
                 initialize_database(connection)
-                build_search_indexes(connection)
+                build_search_indexes(connection, progress_callback=index_progress)
             finally:
                 connection.close()
 
         try:
+            LOGGER.info(
+                "operation=upload operation_id=%s stage=csv_import_started user_id=%s filename=%s source=%s bytes=%s",
+                operation_id, job.uploader_id, job.original_filename, job.source_kind, job.file_size,
+            )
             processed, inserted = await asyncio.to_thread(import_sync)
+            await flush_progress_updates()
         except Exception as exc:
-            LOGGER.exception("Upload import failed filename=%s", job.original_filename)
+            await flush_progress_updates()
+            LOGGER.exception(
+                "operation=upload operation_id=%s stage=csv_import_failed filename=%s error_type=%s",
+                operation_id, job.original_filename, type(exc).__name__,
+            )
             await self._edit_status(
                 job,
-                f"❌ ورود اطلاعات فایل {job.original_filename} ناموفق بود.\n"
-                "جزئیات فنی در گزارش سرور ثبت شد؛ فایل روی سرور نگه داشته شد.",
+                progress_text(
+                    "❌ ورود اطلاعات ناموفق بود",
+                    "خطا هنگام خواندن CSV یا ثبت ردیف‌ها",
+                    100,
+                    operation_id=operation_id,
+                    detail="جزئیات فنی در گزارش سرور ثبت شد؛ فایل روی سرور نگه داشته شد.",
+                ),
             )
             return
 
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=csv_import_complete filename=%s rows_read=%d rows_inserted=%d",
+            operation_id, job.original_filename, processed, inserted,
+        )
         await self._edit_status(
             job,
-            f"⏳ ورود ردیف‌ها کامل شد؛ در حال آماده‌سازی شاخص جست‌وجو برای {job.original_filename}...",
+            progress_text(
+                "⏳ ورود ردیف‌ها کامل شد",
+                "شروع آماده‌سازی شاخص جست‌وجو",
+                0,
+                operation_id=operation_id,
+                detail=job.original_filename,
+            ),
         )
         try:
             await asyncio.to_thread(build_indexes_sync)
+            await flush_progress_updates()
         except Exception:
+            await flush_progress_updates()
             LOGGER.exception(
-                "CSV rows were imported but search index initialization failed filename=%s rows=%d",
-                job.original_filename, processed,
+                "operation=upload operation_id=%s stage=search_index_failed filename=%s rows=%d",
+                operation_id, job.original_filename, processed,
             )
             await self._edit_status(
                 job,
-                f"⚠️ ردیف‌های فایل {job.original_filename} وارد شدند، اما آماده‌سازی جست‌وجو کامل نشد. "
-                "فایل را دوباره نفرستید؛ برای جلوگیری از رکورد تکراری، شاخص‌ها باید تعمیر شوند.",
+                progress_text(
+                    "⚠️ ورود ردیف‌ها کامل شد، اما شاخص‌سازی متوقف شد",
+                    "جزئیات خطا در CMD با کد پیگیری زیر ثبت شده است",
+                    100,
+                    operation_id=operation_id,
+                    detail=(
+                        f"ردیف‌های فایل {job.original_filename} وارد شدند، اما مرحلهٔ شاخص‌سازی کامل نشد. "
+                        "فایل را دوباره نفرستید؛ مرحلهٔ شاخص‌سازی را بررسی کنید."
+                    ),
+                ),
             )
             return
+
+        LOGGER.info(
+            "operation=upload operation_id=%s stage=complete filename=%s rows_read=%d rows_inserted=%d",
+            operation_id, job.original_filename, processed, inserted,
+        )
 
         if self.settings.delete_csv_after_import:
             LOGGER.warning(
@@ -207,10 +352,16 @@ class UploadManager:
             )
         await self._edit_status(
             job,
-            f"✅ ورود اطلاعات کامل شد\n{job.original_filename}\n"
-            f"رکوردهای خوانده‌شده: {processed:,}\n"
-            f"رکوردهای درج‌شده: {inserted:,}\n"
-            "فایل اصلی به‌عنوان منبع داده نگه داشته شد.",
+            progress_text(
+                "✅ ورود اطلاعات کامل شد",
+                "همهٔ مرحله‌ها با موفقیت انجام شدند",
+                100,
+                operation_id=operation_id,
+                detail=(
+                    f"{job.original_filename}\nرکوردهای خوانده‌شده: {processed:,}\n"
+                    f"رکوردهای درج‌شده: {inserted:,}\nفایل اصلی به‌عنوان منبع داده نگه داشته شد."
+                ),
+            ),
         )
 
 
