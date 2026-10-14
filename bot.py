@@ -17,6 +17,7 @@ import re
 import secrets
 import shutil
 import tempfile
+from threading import Event
 import time
 import traceback
 from typing import Any, Callable
@@ -28,6 +29,7 @@ from telegram.constants import ParseMode
 from telegram.error import TimedOut
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -76,11 +78,14 @@ from progress_utils import progress_text
 from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
 from import_csv import read_csv_header
+from search_queue import SearchQueue
 
 LOGGER = logging.getLogger("telegram_csv_search")
 SESSION_KEY = "search_sessions"
 UPLOAD_SELECTION_KEY = "pending_upload_selection"
 UPLOAD_TRANSFER_KEY = "active_upload_transfer"
+SEARCH_QUEUE_KEY = "search_queue"
+UPLOAD_CANCELLATIONS_KEY = "upload_cancellation_events"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
 SEARCH_PREVIEW_LIMIT = 5
@@ -88,6 +93,21 @@ SEARCH_EXPORT_MAX_RECORDS = 2000
 SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
 DATABASE_MANAGEMENT_PAGE_SIZE = 8
+
+
+class SearchCancelled(Exception):
+    """Raised at safe checkpoints when /start cancels a queued search."""
+
+
+class UploadCancelled(Exception):
+    """Raised by a streaming download when /start requests cancellation."""
+
+
+def check_search_cancellation(cancellation_event: Event | None) -> None:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise SearchCancelled
+
+
 TEXT_SEND_TIMEOUT_SECONDS = 30
 
 
@@ -209,6 +229,44 @@ async def deny_if_unauthorized(update: Update, settings: Settings) -> bool:
     if update.effective_message:
         await update.effective_message.reply_text("دسترسی مجاز نیست.")
     return True
+
+
+async def search_busy_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject extra updates from a user who already has a queued/running search."""
+    message = update.effective_message
+    if message and message.text:
+        first_word = message.text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if first_word == "/start":
+            return
+    queue: SearchQueue | None = context.application.bot_data.get(SEARCH_QUEUE_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
+    user_data = context.user_data or {}
+    upload_in_progress = bool(user_data.get(UPLOAD_TRANSFER_KEY))
+    selection_pending = bool(user_data.get(UPLOAD_SELECTION_KEY))
+    callback = update.callback_query
+    if selection_pending and callback and (callback.data or "").startswith("u:"):
+        return
+    if (
+        (queue is None or not queue.is_user_busy(user_id))
+        and not upload_in_progress
+        and not selection_pending
+    ):
+        return
+    LOGGER.info("operation=request stage=busy_update_rejected user_id=%s", user_id)
+    if callback:
+        try:
+            await callback.answer(
+                "در حال پردازش درخواست قبلی شما هستم؛ برای لغو و شروع دوباره /start را بزنید.",
+                show_alert=True,
+            )
+        except Exception:
+            LOGGER.exception("operation=search_queue stage=callback_busy_alert_failed user_id=%s", user_id)
+    elif message:
+        await message.reply_text(
+            "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
+            "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
+        )
+    raise ApplicationHandlerStop
 
 
 def truncate(value: str, limit: int) -> str:
@@ -556,6 +614,9 @@ async def respond_to_search(
     context: ContextTypes.DEFAULT_TYPE,
     settings: Settings,
     raw_query: str,
+    *,
+    status_message=None,
+    cancellation_event: Event | None = None,
 ) -> None:
     query = raw_query.strip()
     if not query:
@@ -570,19 +631,21 @@ async def respond_to_search(
         "operation=search stage=received user_id=%s query_length=%d",
         update.effective_user.id, len(query),
     )
-    status = await update.effective_message.reply_text(progress_text(
+    status = status_message or await update.effective_message.reply_text(progress_text(
         "🔎 جست‌وجو",
         "در حال آماده‌سازی عبارت و اتصال به پایگاه‌داده",
         0,
     ))
     started = time.perf_counter()
     try:
+        check_search_cancellation(cancellation_event)
         await status.edit_text(progress_text(
             "🔎 جست‌وجو",
             "در حال جست‌وجو در شاخص‌های پایگاه‌داده",
             20,
         ))
         result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
+        check_search_cancellation(cancellation_event)
         elapsed_ms = (time.perf_counter() - started) * 1000
         LOGGER.info(
             "operation=search stage=query_complete user_id=%s mode=%s results=%d duration_ms=%.1f",
@@ -598,6 +661,7 @@ async def respond_to_search(
             asyncio.to_thread(load_display_header_aliases, settings),
             asyncio.to_thread(load_hidden_header_keys, settings),
         )
+        check_search_cancellation(cancellation_event)
         if not result.total_count:
             LOGGER.info(
                 "operation=search stage=complete_no_results user_id=%s duration_ms=%.1f",
@@ -616,6 +680,7 @@ async def respond_to_search(
         )
         if result.total_count <= SEARCH_PREVIEW_LIMIT:
             preview = format_search_preview(query, result, settings, aliases, hidden_headers)
+            check_search_cancellation(cancellation_event)
             LOGGER.info(
                 "operation=search stage=preview_ready user_id=%s results=%d",
                 update.effective_user.id, result.total_count,
@@ -651,6 +716,7 @@ async def respond_to_search(
 
         def export_progress(completed: int, total: int) -> None:
             nonlocal last_export_update, last_export_percent
+            check_search_cancellation(cancellation_event)
             now = time.monotonic()
             percent = completed / max(total, 1) * 100
             if (
@@ -715,6 +781,7 @@ async def respond_to_search(
                     max_results=SEARCH_EXPORT_MAX_RECORDS,
                     hidden_headers=hidden_headers,
                 )
+                check_search_cancellation(cancellation_event)
                 await stop_export_progress()
                 if not paths:
                     raise RuntimeError("Search returned a positive count but produced no text export files.")
@@ -738,6 +805,7 @@ async def respond_to_search(
                     ),
                 ))
                 for part_number, path in enumerate(paths, start=1):
+                    check_search_cancellation(cancellation_event)
                     LOGGER.info(
                         "operation=search stage=txt_send_started part=%d parts=%d filename=%s",
                         part_number, len(paths), path.name,
@@ -763,6 +831,8 @@ async def respond_to_search(
                         "operation=search stage=txt_send_complete part=%d parts=%d",
                         part_number, len(paths),
                     )
+        except SearchCancelled:
+            raise
         except (asyncio.TimeoutError, TimedOut):
             LOGGER.warning(
                 "operation=search stage=txt_send_timeout user_id=%s query_length=%d timeout_seconds=%d",
@@ -792,6 +862,16 @@ async def respond_to_search(
                 detail,
                 100,
             ))
+    except SearchCancelled:
+        LOGGER.info("operation=search stage=cancelled_by_start user_id=%s", update.effective_user.id)
+        try:
+            await status.edit_text(progress_text(
+                "⚪ جست‌وجو لغو شد",
+                "درخواست جاری با /start لغو شد و نتیجه ارسال نمی‌شود",
+                100,
+            ))
+        except Exception:
+            LOGGER.exception("operation=search stage=cancel_status_update_failed user_id=%s", update.effective_user.id)
     except Exception as exc:
         _log_exception_redacted(
             "operation=search stage=search_failed user_id=%s query_length=%d error_type=%s"
@@ -810,11 +890,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
+    user_id = update.effective_user.id
+    queue: SearchQueue | None = context.application.bot_data.get(SEARCH_QUEUE_KEY)
+    cancelled_waiting, active_cancel_requested = (0, False)
+    if queue is not None:
+        cancelled_waiting, active_cancel_requested = await queue.cancel_user(user_id)
+    upload_events: dict[int, Event] = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+    upload_event = upload_events.get(user_id)
+    upload_cancel_requested = bool(upload_event and not upload_event.is_set())
+    if upload_event:
+        upload_event.set()
+    context.user_data.pop(SESSION_KEY, None)
+    selection = context.user_data.pop(UPLOAD_SELECTION_KEY, None)
+    if selection is not None:
+        selection.job.path.unlink(missing_ok=True)
+
+    cancellation_note = "جست‌وجوهای منتظر شما لغو شدند." if cancelled_waiting else ""
+    if active_cancel_requested:
+        cancellation_note += (
+            "\nدرخواست جست‌وجوی جاری برای لغو علامت‌گذاری شد و پس از پایان گام فعلی متوقف می‌شود؛ نتیجه‌ای ارسال نخواهد شد."
+        )
+    if upload_cancel_requested:
+        cancellation_note += "\nدانلود جاری Google Drive برای لغو علامت‌گذاری شد؛ فایل ناقص حذف می‌شود."
+    if selection is not None:
+        cancellation_note += "\nانتخاب ستون فایل ناتمام لغو شد و فایل موقت آن پاک شد."
+    if not cancellation_note:
+        cancellation_note = "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت."
     await update.effective_message.reply_text(
         "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
         "اگر حداکثر ۵ نتیجه پیدا شود، همه در پیام نشان داده می‌شوند؛ اگر بیش از ۵ نتیجه باشد، فقط فایل متنی فرستاده می‌شود.\n\n"
         "برای دریافت فایل از Drive، لینک اشتراک‌گذاری CSV را بفرستید؛ مدیر برای دیدن ایمیل دسترسی ربات /drive_setup را اجرا کند.\n"
-        "دستورها: /search <عبارت>، /stats، /admin، /database"
+        "دستورها: /search <عبارت>، /stats، /admin، /database\n\n"
+        f"{cancellation_note}"
     )
 
 
@@ -822,7 +929,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
-    await respond_to_search(update, context, settings, " ".join(context.args))
+    queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
+    await queue.submit(update, context, " ".join(context.args))
 
 
 def _progress_bar(percent: float, width: int = 20) -> str:
@@ -964,7 +1072,8 @@ async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
-    await respond_to_search(update, context, settings, update.effective_message.text or "")
+    queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
+    await queue.submit(update, context, update.effective_message.text or "")
 
 
 def upload_selection_keyboard(session: UploadSelectionSession) -> InlineKeyboardMarkup:
@@ -1047,7 +1156,7 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
             session.selected.add(index)
         LOGGER.info(
             "operation=upload stage=header_selection_toggled user_id=%s column_index=%d selected_count=%d",
-            session.job.update.effective_user.id, index, len(session.selected),
+            session.job.uploader_id, index, len(session.selected),
         )
         await callback.answer()
         await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
@@ -1064,7 +1173,7 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         session.page = page
         LOGGER.info(
             "operation=upload stage=header_selection_page user_id=%s page=%d total_pages=%d",
-            session.job.update.effective_user.id, page + 1, max_page + 1,
+            session.job.uploader_id, page + 1, max_page + 1,
         )
         await callback.answer()
         await callback.edit_message_text(
@@ -1077,7 +1186,7 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         session.job.path.unlink(missing_ok=True)
         LOGGER.info(
             "operation=upload stage=cancelled_by_user user_id=%s filename=%s",
-            session.job.update.effective_user.id, session.job.original_filename,
+            session.job.uploader_id, session.job.original_filename,
         )
         await callback.answer("فایل لغو شد.")
         await callback.edit_message_text(progress_text(
@@ -1095,7 +1204,7 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         position = await manager.enqueue(job)
         LOGGER.info(
             "operation=upload stage=header_selection_confirmed user_id=%s selected_columns=%d queue_position=%d",
-            job.update.effective_user.id, len(job.selected_column_indices or ()), position,
+            job.uploader_id, len(job.selected_column_indices or ()), position,
         )
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         await callback.answer("انتخاب ثبت شد.")
@@ -1119,6 +1228,8 @@ async def show_upload_header_selection(
     settings: Settings,
     job: UploadJob,
     status_message,
+    *,
+    cancellation_event: Event | None = None,
 ) -> None:
     """Read the first CSV row and show the same header picker for every source."""
     LOGGER.info(
@@ -1144,6 +1255,14 @@ async def show_upload_header_selection(
             "مرحلهٔ خواندن header",
             100,
             detail="فایل موقت حذف شد و ورود اطلاعات آغاز نشد.",
+        ))
+        return
+    if cancellation_event is not None and cancellation_event.is_set():
+        job.path.unlink(missing_ok=True)
+        await status_message.edit_text(progress_text(
+            "⚪ دریافت فایل لغو شد",
+            "درخواست با /start لغو شد؛ فایل موقت پاک شد و ورود اطلاعات شروع نشد",
+            100,
         ))
         return
     if context.user_data.get(UPLOAD_SELECTION_KEY):
@@ -1301,6 +1420,7 @@ async def _download_drive_upload(
     reference,
     temporary_path: Path,
     status_message,
+    cancellation_event: Event,
 ) -> None:
     loop = asyncio.get_running_loop()
     started = time.monotonic()
@@ -1327,6 +1447,8 @@ async def _download_drive_upload(
 
     def progress(filename: str, received: int, total: int | None) -> None:
         nonlocal last_update, last_logged_bucket, last_logged_bytes
+        if cancellation_event.is_set():
+            raise UploadCancelled
         now = time.monotonic()
         if received and now - last_update < settings.upload_progress_interval_seconds:
             return
@@ -1363,6 +1485,8 @@ async def _download_drive_upload(
         finally:
             await progress_queue.put(None)
             await progress_task
+        if cancellation_event.is_set():
+            raise UploadCancelled
         actual_size = temporary_path.stat().st_size
         await status_message.edit_text(_drive_progress_text(
             info.name, actual_size, info.size or actual_size, time.monotonic() - started,
@@ -1387,7 +1511,23 @@ async def _download_drive_upload(
             status_message_id=status_message.message_id,
             source_kind="google_drive",
         )
-        await show_upload_header_selection(context, settings, job, status_message)
+        await show_upload_header_selection(
+            context, settings, job, status_message, cancellation_event=cancellation_event
+        )
+    except UploadCancelled:
+        temporary_path.unlink(missing_ok=True)
+        LOGGER.info(
+            "operation=drive_upload stage=cancelled_by_start user_id=%s",
+            update.effective_user.id,
+        )
+        try:
+            await status_message.edit_text(progress_text(
+                "⚪ دریافت فایل لغو شد",
+                "درخواست با /start لغو شد؛ فایل موقت پاک شد و ورود اطلاعات شروع نشد",
+                100,
+            ))
+        except Exception:
+            LOGGER.exception("operation=drive_upload stage=cancel_status_update_failed")
     except DriveAccessDenied as exc:
         temporary_path.unlink(missing_ok=True)
         LOGGER.warning(
@@ -1466,6 +1606,9 @@ async def _download_drive_upload(
         ))
     finally:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        events: dict[int, Event] = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+        if events.get(update.effective_user.id) is cancellation_event:
+            events.pop(update.effective_user.id, None)
 async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Accept a Google Drive file-sharing link in a private Telegram chat."""
     settings: Settings = context.application.bot_data["settings"]
@@ -1503,9 +1646,14 @@ async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
         raise
+    cancellation_event = Event()
+    context.application.bot_data.setdefault(UPLOAD_CANCELLATIONS_KEY, {})[
+        update.effective_user.id
+    ] = cancellation_event
     context.application.create_task(
         _download_drive_upload(
-            update, context, settings, reference, temporary_path, status_message
+            update, context, settings, reference, temporary_path, status_message,
+            cancellation_event,
         ),
         update=update,
         name="google-drive-csv-download",
@@ -2374,6 +2522,9 @@ def main() -> None:
     application.bot_data["settings"] = settings
     manager = UploadManager(settings, application.bot)
     application.bot_data["upload_manager"] = manager
+    search_queue = SearchQueue(respond_to_search)
+    application.bot_data[SEARCH_QUEUE_KEY] = search_queue
+    application.add_handler(TypeHandler(Update, search_busy_guard), group=-2)
     application.add_handler(TypeHandler(Update, log_update_received), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("search", search_command))
@@ -2412,6 +2563,9 @@ def main() -> None:
         LOGGER.info("operation=startup stage=upload_manager_started")
 
     async def post_shutdown(app: Application) -> None:
+        LOGGER.info("operation=shutdown stage=search_queue_stopping")
+        await search_queue.stop()
+        LOGGER.info("operation=shutdown stage=search_queue_stopped")
         LOGGER.info("operation=shutdown stage=upload_manager_stopping")
         await manager.stop()
         LOGGER.info("operation=shutdown stage=upload_manager_stopped")
