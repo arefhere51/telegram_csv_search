@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+PROJECT_DIR="$(dirname -- "$SCRIPT_PATH")"
+MANAGER="$PROJECT_DIR/finderbot_manager.py"
+if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
+  PYTHON_BIN="$PROJECT_DIR/venv/bin/python"
+elif [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+else
+  printf 'FinderBot virtualenv not found under %s/venv or %s/.venv\n' "$PROJECT_DIR" "$PROJECT_DIR" >&2
+  printf 'Run the project installer first.\n' >&2
+  exit 2
+fi
+
+if [[ ! -f "$MANAGER" ]]; then
+  printf 'FinderBot manager not found: %s\n' "$MANAGER" >&2
+  exit 2
+fi
+
+exec "$PYTHON_BIN" -u "$MANAGER" "$@"

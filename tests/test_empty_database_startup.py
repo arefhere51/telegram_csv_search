@@ -23,8 +23,10 @@ class EmptyDatabaseStartupTests(unittest.TestCase):
                 phone_normalization=True, prefix_search_min_length=3, log_level="INFO",
                 upload_enabled=True, upload_max_bytes=3_000_000_000, upload_progress_interval_seconds=3, delete_csv_after_import=False,
                 telegram_base_url="https://api.telegram.org/bot", telegram_file_base_url="https://api.telegram.org/file/bot",
+                admin_user_ids=frozenset({1}),
             )
             settings.data_directory.mkdir()
+            settings.validate_for_bot()
             connection = connect(settings.database_path)
             try:
                 initialize_database(connection)

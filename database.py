@@ -12,7 +12,7 @@ from typing import Callable, Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 LOGGER = logging.getLogger("telegram_csv_search")
 SQLITE_WRITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = 120_000
@@ -99,10 +99,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
             "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
         )
-    if stored_version not in {None, "2", "3", SCHEMA_VERSION}:
+    if stored_version not in {None, "2", "3", "4", SCHEMA_VERSION}:
         raise DatabaseRebuildRequired(
             f"Unsupported SQLite schema version {stored_version!r}; expected "
-            f"2, 3 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+            f"2, 3, 4 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
         )
     connection.executescript(
         """
@@ -167,6 +167,12 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             header_key TEXT PRIMARY KEY,
             source_header TEXT NOT NULL,
             display_header TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS hidden_headers (
+            header_key TEXT PRIMARY KEY,
+            source_header TEXT NOT NULL,
             updated_at TEXT NOT NULL
         ) WITHOUT ROWID;
 
@@ -312,6 +318,44 @@ def set_header_alias(connection: sqlite3.Connection, source_header: str, display
 
 def delete_header_alias(connection: sqlite3.Connection, source_header: str) -> bool:
     cursor = connection.execute("DELETE FROM header_aliases WHERE header_key = ?", (header_alias_key(source_header),))
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def get_hidden_header_keys(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute("SELECT header_key FROM hidden_headers")
+    }
+
+
+def list_hidden_headers(connection: sqlite3.Connection) -> list[str]:
+    return [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT source_header FROM hidden_headers ORDER BY source_header COLLATE NOCASE"
+        )
+    ]
+
+
+def hide_header(connection: sqlite3.Connection, source_header: str) -> bool:
+    source = str(source_header).strip()
+    key = header_alias_key(source)
+    if not key or not source:
+        raise ValueError("A source header name is required.")
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO hidden_headers(header_key, source_header, updated_at) VALUES (?, ?, ?)",
+        (key, source, utc_now()),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def show_header(connection: sqlite3.Connection, source_header: str) -> bool:
+    cursor = connection.execute(
+        "DELETE FROM hidden_headers WHERE header_key = ?",
+        (header_alias_key(source_header),),
+    )
     connection.commit()
     return cursor.rowcount > 0
 

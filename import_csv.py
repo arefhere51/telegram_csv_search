@@ -291,12 +291,11 @@ def _progress_message(
 
 def _progress_log_message(
     relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float,
-    operation_id: str | None = None,
 ) -> str:
     """English progress line written to the server log/console."""
     elapsed, percent = _progress_metrics(file_size, file_handle, started)
     return (
-        f"operation_id={operation_id or '-'} stage=csv_import_progress file={relative_path}; "
+        f"stage=csv_import_progress file={relative_path}; "
         f"rows_read: {processed:,}; rows_inserted: {inserted:,}; "
         f"elapsed: {elapsed:.1f}s; speed: {processed / elapsed:,.0f} rows/s; progress: {percent:.1f}%"
     )
@@ -310,14 +309,13 @@ def import_one_file(
     telegram_metadata: dict[str, object] | None = None,
     progress_callback: Callable[[str], None] | None = None,
     selected_column_indices: tuple[int, ...] | list[int] | None = None,
-    operation_id: str | None = None,
 ) -> tuple[int, int]:
     """Replace one source file atomically at file granularity, committing each batch."""
     relative_path = file_path.relative_to(settings.data_directory).as_posix()
     stat = file_path.stat()
     LOGGER.info(
-        "operation=upload operation_id=%s stage=csv_import_open file=%s bytes=%d",
-        operation_id or "-", relative_path, stat.st_size,
+        "operation=upload stage=csv_import_open file=%s bytes=%d",
+        relative_path, stat.st_size,
     )
     # Header metadata is determined after opening the source, then persisted on the file.
     file_id = mark_file_importing(connection, relative_path=relative_path,
@@ -330,8 +328,8 @@ def import_one_file(
     removed = remove_records_for_source(connection, file_id)
     if removed:
         LOGGER.info(
-            "operation=upload operation_id=%s stage=prior_rows_removed rows=%d file=%s",
-            operation_id or "-", removed, relative_path,
+            "operation=upload stage=prior_rows_removed rows=%d file=%s",
+            removed, relative_path,
         )
 
     rows_processed = 0
@@ -425,7 +423,6 @@ def import_one_file(
                     message = _progress_message(relative_path, rows_processed, rows_inserted, stat.st_size, source, start)
                     LOGGER.info(_progress_log_message(
                         relative_path, rows_processed, rows_inserted, stat.st_size, source, start,
-                        operation_id,
                     ))
                     if progress_callback:
                         progress_callback(message)
@@ -441,8 +438,8 @@ def import_one_file(
             connection.commit()
         if reader.lines.replacement_markers:
             LOGGER.warning(
-                "operation=upload operation_id=%s stage=decode_replacements count=%d file=%s encoding=%s",
-                operation_id or "-", reader.lines.replacement_markers, relative_path, settings.csv_encoding,
+                "operation=upload stage=decode_replacements count=%d file=%s encoding=%s",
+                reader.lines.replacement_markers, relative_path, settings.csv_encoding,
             )
         mark_file_completed(connection, file_id, rows_inserted)
         message = _progress_message(
@@ -454,26 +451,25 @@ def import_one_file(
         LOGGER.info(_progress_log_message(
             relative_path, rows_processed, rows_inserted, stat.st_size,
             type("Progress", (), {"tell": lambda _: stat.st_size})(), start,
-            operation_id,
         ))
         LOGGER.info(
-            "operation=upload operation_id=%s stage=csv_import_complete file=%s rows_read=%d rows_inserted=%d",
-            operation_id or "-", relative_path, rows_processed, rows_inserted,
+            "operation=upload stage=csv_import_complete file=%s rows_read=%d rows_inserted=%d",
+            relative_path, rows_processed, rows_inserted,
         )
         if progress_callback:
             progress_callback(message)
         return rows_processed, rows_inserted
     except (csv.Error, OSError, UnicodeError, ValueError, sqlite3.Error) as exc:  # type: ignore[name-defined]
         LOGGER.exception(
-            "operation=upload operation_id=%s stage=csv_import_failed file=%s error_type=%s",
-            operation_id or "-", relative_path, type(exc).__name__,
+            "operation=upload stage=csv_import_failed file=%s error_type=%s",
+            relative_path, type(exc).__name__,
         )
         try:
             remove_records_for_source(connection, file_id)
         except sqlite3.Error:
             LOGGER.exception(
-                "operation=upload operation_id=%s stage=partial_row_cleanup_failed file=%s",
-                operation_id or "-", relative_path,
+                "operation=upload stage=partial_row_cleanup_failed file=%s",
+                relative_path,
             )
             connection.rollback()
         mark_file_failed(connection, file_id, str(exc))

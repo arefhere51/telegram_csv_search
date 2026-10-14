@@ -165,8 +165,6 @@ class Settings:
             raise ConfigurationError("TELEGRAM_BOT_TOKEN is required to run the bot.")
         if not self.admin_user_ids:
             raise ConfigurationError("Set ADMIN_USER_IDS or include at least one initial owner in ALLOWED_USER_IDS.")
-        if not self.database_path.exists():
-            raise ConfigurationError("Database file does not exist. Run `python import_csv.py` before starting the bot.")
 
 
 def load_settings() -> Settings:

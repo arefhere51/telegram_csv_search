@@ -21,12 +21,15 @@ from database import (
     connect,
     delete_header_alias,
     get_header_aliases,
+    get_hidden_header_keys,
+    hide_header,
     initialize_access_control,
     initialize_database,
     list_bot_users,
     remove_bot_user,
     set_access_mode,
     set_header_alias,
+    show_header,
 )
 from import_csv import OffsetCsvReader, import_one_file
 from search import parse_raw_fields, search_records
@@ -295,6 +298,28 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertTrue(delete_header_alias(self.connection, "national_code"))
         self.assertFalse(get_header_aliases(self.connection))
 
+    def test_hidden_headers_are_removed_from_message_and_txt_but_can_be_restored(self) -> None:
+        row = {
+            "headers_json": '["NATIONAL_CODE", "FULL_NAME"]',
+            "raw_fields_json": '["57661928", "مليحه خباز"]',
+            "source_file": "people.csv",
+            "source_line": 2,
+        }
+        self.assertTrue(hide_header(self.connection, "NATIONAL_CODE"))
+        hidden = get_hidden_header_keys(self.connection)
+        self.assertIn("national_code", hidden)
+        preview = format_record(row, 1, self.settings, hidden_headers=hidden)
+        text = format_full_text_record(row, 1, hidden_headers=hidden)
+        self.assertNotIn("NATIONAL_CODE", preview)
+        self.assertNotIn("57661928", preview)
+        self.assertNotIn("NATIONAL_CODE", text)
+        self.assertNotIn("57661928", text)
+        self.assertTrue(show_header(self.connection, "national_code"))
+        self.assertIn(
+            "57661928",
+            format_full_text_record(row, 1, hidden_headers=get_hidden_header_keys(self.connection)),
+        )
+
     def test_txt_export_contains_all_matches_in_split_files(self) -> None:
         source = self.data_directory / "many.csv"
         rows = ["id,NATIONAL_CODE,FULL_NAME,PHONE\n"]
@@ -321,6 +346,20 @@ class ImportAndSearchTests(unittest.TestCase):
         preview = format_search_preview("نام‌یافته", preview_result, self.settings, aliases)
         self.assertIn("نام‌یافته 4", preview)
         self.assertNotIn("نام‌یافته 5", preview)
+
+        capped_dir = self.data_directory / "exports-capped"
+        capped = write_search_text_exports(
+            self.settings,
+            "نام‌یافته",
+            capped_dir,
+            aliases,
+            page_size=4,
+            max_results=5,
+            filename_prefix="first_five",
+        )
+        capped_text = "".join(path.read_text(encoding="utf-8") for path in capped)
+        self.assertEqual(capped_text.count("━━━━━━━━━━━━━━━━━━"), 5)
+        self.assertEqual(capped_text.count("منبع: many.csv:"), 5)
 
     def test_sensitive_search_commands_are_blocked_in_group_chats(self) -> None:
         class FakeMessage:
@@ -485,7 +524,7 @@ class LegacySchemaTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_schema_v3_migration_creates_access_and_header_alias_tables(self) -> None:
+    def test_schema_v3_migration_creates_access_and_header_tables(self) -> None:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         try:
@@ -498,6 +537,26 @@ class LegacySchemaTests(unittest.TestCase):
             )}
             self.assertIn("bot_users", tables)
             self.assertIn("header_aliases", tables)
+            self.assertIn("hidden_headers", tables)
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertEqual(version, SCHEMA_VERSION)
+        finally:
+            connection.close()
+
+    def test_schema_v4_migration_adds_hidden_header_table(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        try:
+            initialize_database(connection)
+            connection.execute("UPDATE metadata SET value = '4' WHERE key = 'schema_version'")
+            connection.commit()
+            initialize_database(connection)
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            self.assertIn("hidden_headers", tables)
             version = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]

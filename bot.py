@@ -57,18 +57,22 @@ from database import (
     delete_header_alias,
     get_imported_file_details,
     get_header_aliases,
+    get_hidden_header_keys,
     header_alias_key,
+    hide_header,
     initialize_access_control,
     initialize_database,
     list_completed_files,
     list_bot_users,
     list_header_alias_entries,
+    list_hidden_headers,
     remove_bot_user,
     set_access_mode,
     set_header_alias,
+    show_header,
 )
 from logging_utils import configure_logging
-from progress_utils import new_operation_id, progress_text
+from progress_utils import progress_text
 from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
 from import_csv import read_csv_header
@@ -80,6 +84,7 @@ UPLOAD_TRANSFER_KEY = "active_upload_transfer"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
 SEARCH_PREVIEW_LIMIT = 5
+SEARCH_EXPORT_MAX_RECORDS = 2000
 SEARCH_EXPORT_PAGE_SIZE = 1000
 SEARCH_EXPORT_CHUNK_BYTES = 40 * 1024 * 1024
 DATABASE_MANAGEMENT_PAGE_SIZE = 8
@@ -182,6 +187,14 @@ def load_display_header_aliases(settings: Settings) -> dict[str, str]:
         connection.close()
 
 
+def load_hidden_header_keys(settings: Settings) -> set[str]:
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        return get_hidden_header_keys(connection)
+    finally:
+        connection.close()
+
+
 async def deny_if_unauthorized(update: Update, settings: Settings) -> bool:
     if not update.effective_chat or update.effective_chat.type != "private":
         if update.effective_message:
@@ -209,6 +222,7 @@ def format_record(
     index: int,
     settings: Settings,
     header_aliases: dict[str, str] | None = None,
+    hidden_headers: set[str] | None = None,
 ) -> str:
     """Render all fields using the source file's real headers."""
     try:
@@ -219,6 +233,7 @@ def format_record(
     if not headers:
         headers = ["column_1", "column_2", "name", "birth_date", "phone"]
     field_count = max(len(headers), len(raw_fields))
+    hidden = hidden_headers or set()
     values = [
         (
             (header_aliases or {}).get(
@@ -228,6 +243,7 @@ def format_record(
             raw_fields[i] if i < len(raw_fields) else "",
         )
         for i in range(field_count)
+        if header_alias_key(str(headers[i]) if i < len(headers) else f"Column {i + 1}") not in hidden
     ]
     source_budget = min(settings.max_field_display_chars, 315)
     allocation = max(24, source_budget // max(len(values) + 1, 1))
@@ -240,7 +256,10 @@ def format_record(
 
 
 def format_full_text_record(
-    row: Any, index: int, header_aliases: dict[str, str] | None = None
+    row: Any,
+    index: int,
+    header_aliases: dict[str, str] | None = None,
+    hidden_headers: set[str] | None = None,
 ) -> str:
     """Render a complete, untruncated source record as plain UTF-8 text."""
     try:
@@ -251,14 +270,17 @@ def format_full_text_record(
     if not headers:
         headers = [f"column_{i + 1}" for i in range(len(fields))]
     aliases = header_aliases or {}
+    hidden = hidden_headers or set()
     lines: list[str] = ["━━━━━━━━━━━━━━━━━━"]
     for i in range(max(len(headers), len(fields))):
         original = str(headers[i]) if i < len(headers) else f"column_{i + 1}"
+        if header_alias_key(original) in hidden:
+            continue
         label = aliases.get(header_alias_key(original), original)
         value = fields[i] if i < len(fields) else ""
         lines.append(f"{label}: {value}" if value else f"{label}: —")
     lines.append(f"منبع: {row['source_file']}:{row['source_line']}")
-    return "\n".join(lines) + "\n\n"
+    return "\n".join(lines) + "\n"
 
 
 def format_search_preview(
@@ -266,19 +288,13 @@ def format_search_preview(
     result: SearchPage,
     settings: Settings,
     header_aliases: dict[str, str] | None = None,
+    hidden_headers: set[str] | None = None,
 ) -> str:
-    mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(result.mode, "جست‌وجو")
-    lines = [
-        f"<b>عبارت جست‌وجو:</b> {escape(truncate(query, settings.max_query_length))}",
-        f"<b>نوع جست‌وجو:</b> {mode_label}",
-        f"<b>تعداد کل نتیجه‌ها:</b> {result.total_count:,}",
-        "",
-    ]
     rows = list(result.rows[:SEARCH_PREVIEW_LIMIT])
-    lines.extend(format_record(row, i + 1, settings, header_aliases) for i, row in enumerate(rows))
-    if result.total_count > SEARCH_PREVIEW_LIMIT:
-        lines.append("\n<b>نمایش پیام:</b> ۵ نتیجه‌ی اول؛ فایل متنی شامل همه‌ی نتیجه‌هاست.")
-    text = "\n\n".join(lines)
+    text = "\n".join(
+        format_record(row, i + 1, settings, header_aliases, hidden_headers)
+        for i, row in enumerate(rows)
+    )
     return text if len(text) <= 3900 else text[:3899].rsplit("\n", 1)[0] + "\n…"
 
 
@@ -292,17 +308,20 @@ def write_search_text_exports(
     max_chunk_bytes: int = SEARCH_EXPORT_CHUNK_BYTES,
     filename_prefix: str = "نتایج_جست‌وجو",
     progress_callback: Callable[[int, int], None] | None = None,
+    max_results: int | None = None,
+    hidden_headers: set[str] | None = None,
 ) -> list[Path]:
-    """Stream every match to bounded UTF-8 TXT chunks without truncating values."""
+    """Stream up to max_results matching records to bounded UTF-8 TXT chunks."""
     if page_size < 1 or max_chunk_bytes < 4:
         raise ValueError("page_size must be positive and max_chunk_bytes must be at least 4.")
     export_settings = replace(settings, results_per_page=page_size)
     first = run_search(export_settings, query, 0)
     total = first.total_count
-    if total <= 0:
+    export_total = min(total, max_results) if max_results is not None else total
+    if export_total <= 0:
         return []
     if progress_callback:
-        progress_callback(0, total)
+        progress_callback(0, export_total)
     destination.mkdir(parents=True, exist_ok=True)
     filename_prefix = re.sub(r"[^\w-]+", "_", filename_prefix, flags=re.UNICODE).strip("_-")
     filename_prefix = truncate(filename_prefix, 64) or "نتایج_جست‌وجو"
@@ -343,13 +362,14 @@ def write_search_text_exports(
                 written = 0
 
     try:
-        for page in range(math.ceil(total / page_size)):
+        for page in range(math.ceil(export_total / page_size)):
             result = first if page == 0 else run_search(
                 export_settings, query, page, mode=first.mode, count_total=False
             )
-            for offset, row in enumerate(result.rows):
+            page_rows = result.rows[: max(0, export_total - page * page_size)]
+            for offset, row in enumerate(page_rows):
                 record = format_full_text_record(
-                    row, page * page_size + offset + 1, header_aliases
+                    row, page * page_size + offset + 1, header_aliases, hidden_headers
                 ).encode("utf-8")
                 # Keep ordinary records intact within one part. Only a single row larger
                 # than the part limit is split, always at a UTF-8 boundary.
@@ -361,7 +381,7 @@ def write_search_text_exports(
                     written = 0
                 write_payload(record)
             if progress_callback:
-                progress_callback(min((page + 1) * page_size, total), total)
+                progress_callback(min((page + 1) * page_size, export_total), export_total)
         if not paths:
             raise RuntimeError("Search count was positive but no rows were returned.")
     finally:
@@ -371,9 +391,11 @@ def write_search_text_exports(
 
 
 
-def page_needs_full_csv(result: SearchPage, settings: Settings) -> bool:
+def page_needs_full_csv(
+    result: SearchPage, settings: Settings, hidden_headers: set[str] | None = None
+) -> bool:
     """Return true if the chat preview would shorten values or exceed Telegram limits."""
-    if len(format_page("", 0, result, settings)) > 3900:
+    if len(format_page("", 0, result, settings, hidden_headers=hidden_headers)) > 3900:
         return True
     for row in result.rows:
         raw_fields = parse_raw_fields(row)
@@ -381,19 +403,38 @@ def page_needs_full_csv(result: SearchPage, settings: Settings) -> bool:
             headers = json.loads(row["headers_json"] or "[]")
         except (TypeError, ValueError, json.JSONDecodeError):
             headers = []
-        field_count = max(len(headers), len(raw_fields))
+        hidden = hidden_headers or set()
+        visible_indices = [
+            index for index in range(max(len(headers), len(raw_fields)))
+            if header_alias_key(
+                str(headers[index]) if index < len(headers) else f"Column {index + 1}"
+            ) not in hidden
+        ]
+        field_count = len(visible_indices)
         source_budget = min(settings.max_field_display_chars, 315)
         allocation = max(24, source_budget // max(field_count + 1, 1))
-        if any(len(value) > allocation for value in raw_fields if value):
+        if any(
+            len(raw_fields[index]) > allocation
+            for index in visible_indices
+            if index < len(raw_fields) and raw_fields[index]
+        ):
             return True
     return False
 
 
-def full_results_csv_bytes(query: str, page: int, result: SearchPage) -> bytes:
-    """Serialize every original field on the current page for complete delivery."""
+def full_results_csv_bytes(
+    query: str,
+    page: int,
+    result: SearchPage,
+    header_aliases: dict[str, str] | None = None,
+    hidden_headers: set[str] | None = None,
+) -> bytes:
+    """Serialize visible fields on the current page for complete delivery."""
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(["query", query, "page", page + 1])
+    aliases = header_aliases or {}
+    hidden = hidden_headers or set()
     for number, row in enumerate(result.rows, start=1):
         try:
             headers = json.loads(row["headers_json"] or "[]")
@@ -403,8 +444,22 @@ def full_results_csv_bytes(query: str, page: int, result: SearchPage) -> bytes:
         if not headers:
             headers = [f"column_{index + 1}" for index in range(len(fields))]
         writer.writerow(["result", number, "source", row["source_file"], "line", row["source_line"]])
-        writer.writerow([str(value) for value in headers])
-        writer.writerow(fields)
+        visible_indices = [
+            index for index in range(max(len(headers), len(fields)))
+            if header_alias_key(
+                str(headers[index]) if index < len(headers) else f"column_{index + 1}"
+            ) not in hidden
+        ]
+        writer.writerow([
+            aliases.get(
+                header_alias_key(
+                    str(headers[index]) if index < len(headers) else f"column_{index + 1}"
+                ),
+                str(headers[index]) if index < len(headers) else f"column_{index + 1}",
+            )
+            for index in visible_indices
+        ])
+        writer.writerow([fields[index] if index < len(fields) else "" for index in visible_indices])
         writer.writerow([])
     return output.getvalue().encode("utf-8-sig")
 
@@ -416,6 +471,8 @@ def format_page(
     settings: Settings,
     *,
     full_csv_attached: bool = False,
+    header_aliases: dict[str, str] | None = None,
+    hidden_headers: set[str] | None = None,
 ) -> str:
     visible_total = min(result.total_count, settings.max_results)
     start = page * settings.results_per_page + 1
@@ -433,13 +490,14 @@ def format_page(
         )
     else:
         header += f"<b>تعداد:</b> {result.total_count:,}\n"
-    header += f"<b>نمایش:</b> {start:,} تا {end:,}\n\n"
+    header += f"<b>نمایش:</b> {start:,} تا {end:,}\n"
     records = [
-        format_record(row, start + offset, settings) for offset, row in enumerate(result.rows)
+        format_record(row, start + offset, settings, header_aliases, hidden_headers)
+        for offset, row in enumerate(result.rows)
     ]
     # The construction budgets each record; this final cap additionally protects unusual
     # escape expansion. Result metadata remains intact if a pathological row is encountered.
-    message = header + "\n\n".join(records)
+    message = header + "\n".join(records)
     return message if len(message) <= 3900 else message[:3899].rsplit("\n", 1)[0] + "\n…"
 
 
@@ -508,19 +566,14 @@ async def respond_to_search(
             f"عبارت جست‌وجو بیش از حد طولانی است؛ حداکثر {settings.max_query_length} نویسه مجاز است."
         )
         return
-    operation_id = new_operation_id()
-    user_data = getattr(context, "user_data", None)
-    if isinstance(user_data, dict):
-        user_data["active_operation_id"] = operation_id
     LOGGER.info(
-        "operation=search operation_id=%s stage=received user_id=%s query_length=%d",
-        operation_id, update.effective_user.id, len(query),
+        "operation=search stage=received user_id=%s query_length=%d",
+        update.effective_user.id, len(query),
     )
     status = await update.effective_message.reply_text(progress_text(
         "🔎 جست‌وجو",
         "در حال آماده‌سازی عبارت و اتصال به پایگاه‌داده",
         0,
-        operation_id=operation_id,
     ))
     started = time.perf_counter()
     try:
@@ -528,49 +581,58 @@ async def respond_to_search(
             "🔎 جست‌وجو",
             "در حال جست‌وجو در شاخص‌های پایگاه‌داده",
             20,
-            operation_id=operation_id,
         ))
         result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
         elapsed_ms = (time.perf_counter() - started) * 1000
         LOGGER.info(
-            "operation=search operation_id=%s stage=query_complete user_id=%s mode=%s results=%d duration_ms=%.1f",
-            operation_id, update.effective_user.id, result.mode, result.total_count, elapsed_ms,
+            "operation=search stage=query_complete user_id=%s mode=%s results=%d duration_ms=%.1f",
+            update.effective_user.id, result.mode, result.total_count, elapsed_ms,
         )
         await status.edit_text(progress_text(
             "🔎 جست‌وجو",
             "خواندن عنوان ستون‌ها و آماده‌سازی نمایش نتیجه",
             60,
-            operation_id=operation_id,
             detail=f"تعداد رکوردهای منطبق: {result.total_count:,}",
         ))
-        aliases = await asyncio.to_thread(load_display_header_aliases, settings)
+        aliases, hidden_headers = await asyncio.gather(
+            asyncio.to_thread(load_display_header_aliases, settings),
+            asyncio.to_thread(load_hidden_header_keys, settings),
+        )
         if not result.total_count:
             LOGGER.info(
-                "operation=search operation_id=%s stage=complete_no_results user_id=%s duration_ms=%.1f",
-                operation_id, update.effective_user.id, (time.perf_counter() - started) * 1000,
+                "operation=search stage=complete_no_results user_id=%s duration_ms=%.1f",
+                update.effective_user.id, (time.perf_counter() - started) * 1000,
             )
             await status.edit_text(progress_text(
                 "✅ جست‌وجو کامل شد",
                 "نتیجه‌ای پیدا نشد",
                 100,
-                operation_id=operation_id,
-                detail="عبارت دقیق‌تر یا کامل‌تری را امتحان کنید.",
+                detail=f"عبارت جست‌وجو: {escape(query)}\nلطفاً عبارت دیگری را امتحان کنید.",
             ))
             return
 
+        mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(
+            result.mode, "جست‌وجو"
+        )
         if result.total_count <= SEARCH_PREVIEW_LIMIT:
-            preview = format_search_preview(query, result, settings, aliases)
+            preview = format_search_preview(query, result, settings, aliases, hidden_headers)
             LOGGER.info(
-                "operation=search operation_id=%s stage=preview_ready user_id=%s results=%d",
-                operation_id, update.effective_user.id, result.total_count,
+                "operation=search stage=preview_ready user_id=%s results=%d",
+                update.effective_user.id, result.total_count,
             )
             await status.edit_text(
                 progress_text(
                     "✅ جست‌وجو کامل شد",
-                    "نتیجه آماده و ارسال شد",
+                    "نتیجه آماده است",
                     100,
-                    operation_id=operation_id,
-                ) + "\n\n" + preview,
+                    detail=(
+                        f"عبارت جست‌وجو: {escape(query)}\nنوع جست‌وجو: {mode_label}\n"
+                        f"تعداد کل نتیجه‌ها: {result.total_count:,}"
+                    ),
+                )
+            )
+            await update.effective_message.reply_text(
+                preview,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -578,10 +640,9 @@ async def respond_to_search(
 
         await status.edit_text(progress_text(
             "📄 ساخت فایل نتیجه‌ها",
-            "در حال آماده‌سازی فایل TXT برای همهٔ رکوردها",
+            f"در حال آماده‌سازی فایل TXT؛ حداکثر {SEARCH_EXPORT_MAX_RECORDS:,} رکورد",
             65,
-            operation_id=operation_id,
-            detail=f"تعداد رکوردها: {result.total_count:,}",
+            detail=f"تعداد کل نتیجه‌ها: {result.total_count:,}",
         ))
         loop = asyncio.get_running_loop()
         export_queue: asyncio.Queue[tuple[int, int] | None] = asyncio.Queue()
@@ -599,16 +660,13 @@ async def respond_to_search(
                 last_export_update = now
                 last_export_percent = percent
                 LOGGER.info(
-                    "operation=search operation_id=%s stage=txt_export progress=%.1f records=%d total=%d",
-                    operation_id, percent, completed, total,
+                    "operation=search stage=txt_export progress=%.1f records=%d total=%d",
+                    percent, completed, total,
                 )
                 try:
                     loop.call_soon_threadsafe(export_queue.put_nowait, (completed, total))
                 except RuntimeError:
-                    LOGGER.warning(
-                        "operation=search operation_id=%s stage=txt_progress_loop_unavailable",
-                        operation_id,
-                    )
+                    LOGGER.warning("operation=search stage=txt_progress_loop_unavailable")
 
         async def consume_export_progress() -> None:
             while True:
@@ -622,17 +680,13 @@ async def respond_to_search(
                         "📄 ساخت فایل نتیجه‌ها",
                         "در حال نوشتن رکوردها در فایل TXT",
                         pct,
-                        operation_id=operation_id,
                         detail=f"{completed:,} از {total:,} رکورد پردازش شد",
                     ))
                 except Exception:
-                    LOGGER.exception(
-                        "operation=search operation_id=%s stage=txt_progress_message_failed",
-                        operation_id,
-                    )
+                    LOGGER.exception("operation=search stage=txt_progress_message_failed")
 
         progress_task: asyncio.Task | None = asyncio.create_task(
-            consume_export_progress(), name=f"txt-progress-{operation_id}"
+            consume_export_progress(), name="txt-progress"
         )
 
         async def stop_export_progress() -> None:
@@ -658,25 +712,35 @@ async def respond_to_search(
                     aliases,
                     filename_prefix=f"نتایج_{safe_query}",
                     progress_callback=export_progress,
+                    max_results=SEARCH_EXPORT_MAX_RECORDS,
+                    hidden_headers=hidden_headers,
                 )
                 await stop_export_progress()
                 if not paths:
                     raise RuntimeError("Search returned a positive count but produced no text export files.")
                 LOGGER.info(
-                    "operation=search operation_id=%s stage=txt_export_complete parts=%d results=%d",
-                    operation_id, len(paths), result.total_count,
+                    "operation=search stage=txt_export_complete parts=%d results=%d exported=%d",
+                    len(paths), result.total_count, min(result.total_count, SEARCH_EXPORT_MAX_RECORDS),
                 )
+                exported_count = min(result.total_count, SEARCH_EXPORT_MAX_RECORDS)
+                cap_note = (
+                    "\nفقط ۲۰۰۰ نتیجهٔ اول در فایل آمده است؛ لطفاً دقیق‌تر جست‌وجو کنید."
+                    if result.total_count > SEARCH_EXPORT_MAX_RECORDS else ""
+                )
+                await status.edit_text(progress_text(
+                    "✅ جست‌وجو کامل شد",
+                    "فایل نتیجه آماده و در پیام بعدی ارسال می‌شود",
+                    100,
+                    detail=(
+                        f"عبارت جست‌وجو: {escape(query)}\nنوع جست‌وجو: {mode_label}\n"
+                        f"تعداد کل نتیجه‌ها: {result.total_count:,}\n"
+                        f"تعداد رکوردهای فایل: {exported_count:,}{cap_note}"
+                    ),
+                ))
                 for part_number, path in enumerate(paths, start=1):
-                    part_percent = 87.0 + 12.0 * (part_number - 1) / max(len(paths), 1)
-                    await status.edit_text(progress_text(
-                        "📤 ارسال فایل نتیجه‌ها",
-                        f"در حال ارسال بخش {part_number} از {len(paths)}",
-                        part_percent,
-                        operation_id=operation_id,
-                    ))
                     LOGGER.info(
-                        "operation=search operation_id=%s stage=txt_send_started part=%d parts=%d filename=%s",
-                        operation_id, part_number, len(paths), path.name,
+                        "operation=search stage=txt_send_started part=%d parts=%d filename=%s",
+                        part_number, len(paths), path.name,
                     )
                     with path.open("rb") as document:
                         await asyncio.wait_for(
@@ -686,7 +750,7 @@ async def respond_to_search(
                                 filename=path.name,
                                 caption=(
                                     f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}\n"
-                                    f"بخش {part_number} از {len(paths)}؛ همهٔ فیلدهای کامل ردیف‌های منطبق."
+                                    f"تعداد رکوردهای داخل فایل: {exported_count:,}{cap_note}"
                                 ),
                                 read_timeout=TEXT_SEND_TIMEOUT_SECONDS,
                                 write_timeout=TEXT_SEND_TIMEOUT_SECONDS,
@@ -696,20 +760,13 @@ async def respond_to_search(
                             timeout=TEXT_SEND_TIMEOUT_SECONDS,
                         )
                     LOGGER.info(
-                        "operation=search operation_id=%s stage=txt_send_complete part=%d parts=%d",
-                        operation_id, part_number, len(paths),
+                        "operation=search stage=txt_send_complete part=%d parts=%d",
+                        part_number, len(paths),
                     )
-                await status.edit_text(progress_text(
-                    "✅ جست‌وجو و ارسال کامل شد",
-                    "همهٔ فایل‌های نتیجه ارسال شدند",
-                    100,
-                    operation_id=operation_id,
-                    detail=f"تعداد کل رکوردهای یافت‌شده: {result.total_count:,}",
-                ))
-        except (asyncio.TimeoutError, TimedOut) as exc:
+        except (asyncio.TimeoutError, TimedOut):
             LOGGER.warning(
-                "operation=search operation_id=%s stage=txt_send_timeout user_id=%s query_length=%d timeout_seconds=%d",
-                operation_id, update.effective_user.id, len(query), TEXT_SEND_TIMEOUT_SECONDS,
+                "operation=search stage=txt_send_timeout user_id=%s query_length=%d timeout_seconds=%d",
+                update.effective_user.id, len(query), TEXT_SEND_TIMEOUT_SECONDS,
             )
             delivery_failure = (
                 "❌ ارسال فایل نتیجه کامل نشد",
@@ -717,14 +774,14 @@ async def respond_to_search(
             )
         except Exception as exc:
             _log_exception_redacted(
-                "operation=search operation_id=%s stage=txt_export_or_send_failed user_id=%s error_type=%s"
-                % (operation_id, update.effective_user.id, type(exc).__name__),
+                "operation=search stage=txt_export_or_send_failed user_id=%s error_type=%s"
+                % (update.effective_user.id, type(exc).__name__),
                 exc,
                 getattr(settings, "telegram_bot_token", None),
             )
             delivery_failure = (
                 "❌ ساخت یا ارسال فایل نتیجه‌ها ناموفق بود",
-                "مرحلهٔ دقیق خطا در CMD با کد پیگیری ثبت شده است",
+                "خطای فنی در گزارش سرور ثبت شده است؛ لطفاً دوباره تلاش کنید.",
             )
         finally:
             await stop_export_progress()
@@ -734,25 +791,19 @@ async def respond_to_search(
                 title,
                 detail,
                 100,
-                operation_id=operation_id,
             ))
     except Exception as exc:
         _log_exception_redacted(
-            "operation=search operation_id=%s stage=search_failed user_id=%s query_length=%d error_type=%s"
-            % (operation_id, update.effective_user.id, len(query), type(exc).__name__),
+            "operation=search stage=search_failed user_id=%s query_length=%d error_type=%s"
+            % (update.effective_user.id, len(query), type(exc).__name__),
             exc,
             getattr(settings, "telegram_bot_token", None),
         )
         await status.edit_text(progress_text(
             "❌ جست‌وجو ناموفق بود",
-            "مرحلهٔ دقیق خطا در CMD با کد پیگیری ثبت شده است",
+            "خطای فنی در گزارش سرور ثبت شده است؛ لطفاً دوباره تلاش کنید.",
             100,
-            operation_id=operation_id,
-            detail="کد پیگیری را برای بررسی لاگ‌ها نگه دارید.",
         ))
-    finally:
-        if isinstance(user_data, dict):
-            user_data.pop("active_operation_id", None)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -763,17 +814,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
         "اگر حداکثر ۵ نتیجه پیدا شود، همه در پیام نشان داده می‌شوند؛ اگر بیش از ۵ نتیجه باشد، فقط فایل متنی فرستاده می‌شود.\n\n"
         "برای دریافت فایل از Drive، لینک اشتراک‌گذاری CSV را بفرستید؛ مدیر برای دیدن ایمیل دسترسی ربات /drive_setup را اجرا کند.\n"
-        "دستورها: /search <عبارت>، /stats، /help، /admin"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]
-    if await deny_if_unauthorized(update, settings):
-        return
-    await update.effective_message.reply_text(
-        "برای جست‌وجو یک مقدار بفرستید یا از /search استفاده کنید. هنگام بارگذاری CSV ستون‌های جست‌وجو را انتخاب می‌کنید؛ نتیجه همه‌ی فیلدهای ردیف را دارد. "
-        "برای دریافت CSV از Drive، لینک فایل را بفرستید. مدیر: /drive_setup، /admin، /database، /user_add، /user_remove، /access، /header_set و /header_aliases."
+        "دستورها: /search <عبارت>، /stats، /admin، /database"
     )
 
 
@@ -823,7 +864,6 @@ async def download_file_with_progress(
     message_id: int,
     filename: str,
     total_bytes: int | None,
-    operation_id: str | None = None,
 ) -> None:
     """Stream a Telegram file to disk and edit one status message periodically.
 
@@ -855,8 +895,8 @@ async def download_file_with_progress(
             should_log = received - last_logged_bytes >= 64 * 1024 * 1024 or complete
         if should_log:
             LOGGER.info(
-                "operation=telegram_download operation_id=%s stage=%s progress=%.1f received_bytes=%d expected_bytes=%s speed_bytes_per_second=%.0f",
-                operation_id or "-", "download_complete" if complete else "downloading",
+                "operation=telegram_download stage=%s progress=%.1f received_bytes=%d expected_bytes=%s speed_bytes_per_second=%.0f",
+                "download_complete" if complete else "downloading",
                 percent, received, expected_bytes, received / elapsed,
             )
             last_logged_bytes = received
@@ -868,7 +908,6 @@ async def download_file_with_progress(
                     "⬇️ دریافت فایل از Telegram",
                     "دریافت کامل شد" if complete else "در حال دریافت فایل",
                     percent,
-                    operation_id=operation_id,
                     detail=(
                         f"حجم دریافت‌شده: {_human_bytes(received)}"
                         + (f" از {_human_bytes(expected_bytes)}" if expected_bytes else "")
@@ -877,14 +916,11 @@ async def download_file_with_progress(
                 ),
             )
         except Exception:
-            LOGGER.exception(
-                "operation=telegram_download operation_id=%s stage=progress_message_update_failed",
-                operation_id or "-",
-            )
+            LOGGER.exception("operation=telegram_download stage=progress_message_update_failed")
 
     LOGGER.info(
-        "operation=telegram_download operation_id=%s stage=started filename=%s expected_bytes=%s",
-        operation_id or "-", filename, expected_bytes,
+        "operation=telegram_download stage=started filename=%s expected_bytes=%s",
+        filename, expected_bytes,
     )
     await update_progress(0)
     if local_source.is_absolute():
@@ -966,7 +1002,6 @@ def upload_selection_prompt(session: UploadSelectionSession) -> str:
         "✅ دریافت فایل و خواندن سرستون‌ها کامل شد",
         "در انتظار انتخاب ستون‌ها توسط شما",
         100,
-        operation_id=getattr(session.job, "operation_id", None),
         detail=(
             f"{session.job.original_filename}\n"
             f"ستون‌هایی را که باید در جست‌وجو باشند انتخاب کنید ({len(session.headers)} ستون).\n"
@@ -1011,8 +1046,8 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         else:
             session.selected.add(index)
         LOGGER.info(
-            "operation=upload operation_id=%s stage=header_selection_toggled user_id=%s column_index=%d selected_count=%d",
-            session.job.operation_id or "-", update.effective_user.id, index, len(session.selected),
+            "operation=upload stage=header_selection_toggled user_id=%s column_index=%d selected_count=%d",
+            session.job.update.effective_user.id, index, len(session.selected),
         )
         await callback.answer()
         await callback.edit_message_reply_markup(reply_markup=upload_selection_keyboard(session))
@@ -1028,8 +1063,8 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
             return
         session.page = page
         LOGGER.info(
-            "operation=upload operation_id=%s stage=header_selection_page user_id=%s page=%d total_pages=%d",
-            session.job.operation_id or "-", update.effective_user.id, page + 1, max_page + 1,
+            "operation=upload stage=header_selection_page user_id=%s page=%d total_pages=%d",
+            session.job.update.effective_user.id, page + 1, max_page + 1,
         )
         await callback.answer()
         await callback.edit_message_text(
@@ -1041,15 +1076,14 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         session.job.path.unlink(missing_ok=True)
         LOGGER.info(
-            "operation=upload operation_id=%s stage=cancelled_by_user user_id=%s filename=%s",
-            session.job.operation_id or "-", update.effective_user.id, session.job.original_filename,
+            "operation=upload stage=cancelled_by_user user_id=%s filename=%s",
+            session.job.update.effective_user.id, session.job.original_filename,
         )
         await callback.answer("فایل لغو شد.")
         await callback.edit_message_text(progress_text(
             "⚪ عملیات لغو شد",
             "فایل موقت حذف شد و ورود اطلاعات شروع نشد",
             100,
-            operation_id=session.job.operation_id,
         ))
         return
     if action == "done":
@@ -1060,8 +1094,8 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
         manager: UploadManager = context.application.bot_data["upload_manager"]
         position = await manager.enqueue(job)
         LOGGER.info(
-            "operation=upload operation_id=%s stage=header_selection_confirmed user_id=%s selected_columns=%d queue_position=%d",
-            job.operation_id or "-", update.effective_user.id, len(job.selected_column_indices or ()), position,
+            "operation=upload stage=header_selection_confirmed user_id=%s selected_columns=%d queue_position=%d",
+            job.update.effective_user.id, len(job.selected_column_indices or ()), position,
         )
         sessions.pop(UPLOAD_SELECTION_KEY, None)
         await callback.answer("انتخاب ثبت شد.")
@@ -1070,7 +1104,6 @@ async def upload_selection_callback(update: Update, context: ContextTypes.DEFAUL
                 "📥 ستون‌های انتخابی ثبت شدند",
                 f"در صف ورود اطلاعات؛ موقعیت {position}",
                 0,
-                operation_id=job.operation_id,
                 detail=(
                     f"{job.original_filename}\nجست‌وجو فقط در ستون‌های انتخاب‌شده انجام می‌شود؛ "
                     "همهٔ فیلدهای ردیف نتیجه نمایش داده می‌شوند."
@@ -1088,31 +1121,28 @@ async def show_upload_header_selection(
     status_message,
 ) -> None:
     """Read the first CSV row and show the same header picker for every source."""
-    operation_id = job.operation_id or "-"
     LOGGER.info(
-        "operation=upload operation_id=%s stage=header_read_started user_id=%s filename=%s",
-        operation_id, job.uploader_id, job.original_filename,
+        "operation=upload stage=header_read_started user_id=%s filename=%s",
+        job.uploader_id, job.original_filename,
     )
     await status_message.edit_text(progress_text(
         "📑 آماده‌سازی فایل برای ورود",
         "در حال خواندن سرستون‌های CSV",
         0,
-        operation_id=job.operation_id,
         detail=job.original_filename,
     ))
     try:
         headers = await asyncio.to_thread(read_csv_header, job.path, settings)
     except Exception:
         LOGGER.exception(
-            "operation=upload operation_id=%s stage=header_read_failed user_id=%s filename=%s",
-            operation_id, job.uploader_id, job.original_filename,
+            "operation=upload stage=header_read_failed user_id=%s filename=%s",
+            job.uploader_id, job.original_filename,
         )
         job.path.unlink(missing_ok=True)
         await status_message.edit_text(progress_text(
             "❌ خواندن سرستون‌ها ناموفق بود",
             "مرحلهٔ خواندن header",
             100,
-            operation_id=job.operation_id,
             detail="فایل موقت حذف شد و ورود اطلاعات آغاز نشد.",
         ))
         return
@@ -1130,8 +1160,8 @@ async def show_upload_header_selection(
     )
     context.user_data[UPLOAD_SELECTION_KEY] = selection
     LOGGER.info(
-        "operation=upload operation_id=%s stage=header_read_complete filename=%s columns=%d pages=%d",
-        operation_id, job.original_filename, len(headers), max(math.ceil(len(headers) / UPLOAD_HEADER_PAGE_SIZE), 1),
+        "operation=upload stage=header_read_complete filename=%s columns=%d pages=%d",
+        job.original_filename, len(headers), max(math.ceil(len(headers) / UPLOAD_HEADER_PAGE_SIZE), 1),
     )
     await status_message.edit_text(
         upload_selection_prompt(selection),
@@ -1145,33 +1175,30 @@ async def _download_telegram_document(
     settings: Settings,
     document,
     filename: str,
-    operation_id: str,
 ) -> None:
     message = update.effective_message
     settings.data_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = safe_upload_path(settings.data_directory, filename)
     final_path = temporary_path.with_suffix("")
     LOGGER.info(
-        "operation=telegram_upload operation_id=%s stage=upload_received user_id=%s filename=%s bytes=%s",
-        operation_id, update.effective_user.id, filename, document.file_size,
+        "operation=telegram_upload stage=upload_received user_id=%s filename=%s bytes=%s",
+        update.effective_user.id, filename, document.file_size,
     )
     status_message = await message.reply_text(progress_text(
         "📦 فایل دریافت شد",
         "آماده‌سازی دریافت از Telegram",
         0,
-        operation_id=operation_id,
         detail=filename,
     ))
     try:
         LOGGER.info(
-            "operation=telegram_upload operation_id=%s stage=telegram_get_file_started filename=%s",
-            operation_id, filename,
+            "operation=telegram_upload stage=telegram_get_file_started filename=%s",
+            filename,
         )
         telegram_file = await context.bot.get_file(document.file_id)
         await download_file_with_progress(
             settings, telegram_file.file_path, temporary_path, context.bot,
             status_message.chat_id, status_message.message_id, filename, document.file_size,
-            operation_id=operation_id,
         )
         actual_size = temporary_path.stat().st_size
         if actual_size > settings.upload_max_bytes:
@@ -1182,14 +1209,14 @@ async def _download_telegram_document(
             return
         temporary_path.replace(final_path)
         LOGGER.info(
-            "operation=telegram_upload operation_id=%s stage=download_complete filename=%s bytes=%d path=%s",
-            operation_id, filename, actual_size, final_path,
+            "operation=telegram_upload stage=download_complete filename=%s bytes=%d path=%s",
+            filename, actual_size, final_path,
         )
     except Exception as exc:
         detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
         _log_exception_redacted(
-            "operation=telegram_upload operation_id=%s stage=download_failed user_id=%s filename=%s error_type=%s detail=%s"
-            % (operation_id, update.effective_user.id, filename, type(exc).__name__, detail),
+            "operation=telegram_upload stage=download_failed user_id=%s filename=%s error_type=%s detail=%s"
+            % (update.effective_user.id, filename, type(exc).__name__, detail),
             exc,
             settings.telegram_bot_token,
             document.file_id,
@@ -1199,7 +1226,6 @@ async def _download_telegram_document(
             "❌ دریافت فایل ناموفق بود",
             "مرحلهٔ دریافت از Telegram",
             100,
-            operation_id=operation_id,
             detail="فایل ناقص حذف شد؛ جزئیات و traceback در CMD ثبت شد.",
         ))
         return
@@ -1212,7 +1238,6 @@ async def _download_telegram_document(
         uploader_id=update.effective_user.id,
         chat_id=update.effective_chat.id,
         status_message_id=status_message.message_id,
-        operation_id=operation_id,
     )
     await show_upload_header_selection(context, settings, job, status_message)
 
@@ -1243,25 +1268,19 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
         return
     context.user_data[UPLOAD_TRANSFER_KEY] = "telegram"
-    operation_id = new_operation_id()
-    context.user_data["active_operation_id"] = operation_id
     try:
         LOGGER.info(
-            "operation=telegram_upload operation_id=%s stage=accepted user_id=%s filename=%s expected_bytes=%s",
-            operation_id, update.effective_user.id, filename, document.file_size,
+            "operation=telegram_upload stage=accepted user_id=%s filename=%s expected_bytes=%s",
+            update.effective_user.id, filename, document.file_size,
         )
-        await _download_telegram_document(update, context, settings, document, filename, operation_id)
+        await _download_telegram_document(update, context, settings, document, filename)
     finally:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-        context.user_data.pop("active_operation_id", None)
-
-
 def _drive_progress_text(
     filename: str,
     received: int,
     total: int | None,
     elapsed: float,
-    operation_id: str | None = None,
     *,
     complete: bool = False,
 ) -> str:
@@ -1271,7 +1290,6 @@ def _drive_progress_text(
         "🔗 دریافت فایل از Google Drive",
         "دریافت کامل شد" if complete else "در حال دریافت فایل",
         percent,
-        operation_id=operation_id,
         detail=f"{filename}\nحجم: {size}\nسرعت: {_human_bytes(received / max(elapsed, 0.001))} در ثانیه",
     )
 
@@ -1283,7 +1301,6 @@ async def _download_drive_upload(
     reference,
     temporary_path: Path,
     status_message,
-    operation_id: str,
 ) -> None:
     loop = asyncio.get_running_loop()
     started = time.monotonic()
@@ -1299,7 +1316,7 @@ async def _download_drive_upload(
                 return
             filename, received, total = item
             text = _drive_progress_text(
-                filename, received, total, time.monotonic() - started, operation_id
+                filename, received, total, time.monotonic() - started
             )
             try:
                 await status_message.edit_text(text)
@@ -1323,16 +1340,16 @@ async def _download_drive_upload(
             should_log = received - last_logged_bytes >= 64 * 1024 * 1024
         if should_log:
             LOGGER.info(
-                "operation=drive_upload operation_id=%s stage=downloading progress=%.1f received_bytes=%d total_bytes=%s",
-                operation_id, percent, received, total,
+                "operation=drive_upload stage=downloading progress=%.1f received_bytes=%d total_bytes=%s",
+                percent, received, total,
             )
             last_logged_bytes = received
         loop.call_soon_threadsafe(progress_queue.put_nowait, (filename, received, total))
 
     try:
         LOGGER.info(
-            "operation=drive_upload operation_id=%s stage=download_started user_id=%s",
-            operation_id, update.effective_user.id,
+            "operation=drive_upload stage=download_started user_id=%s",
+            update.effective_user.id,
         )
         try:
             info = await asyncio.to_thread(
@@ -1349,11 +1366,11 @@ async def _download_drive_upload(
         actual_size = temporary_path.stat().st_size
         await status_message.edit_text(_drive_progress_text(
             info.name, actual_size, info.size or actual_size, time.monotonic() - started,
-            operation_id, complete=True,
+            complete=True,
         ))
         LOGGER.info(
-            "operation=drive_upload operation_id=%s stage=download_complete filename=%s bytes=%d",
-            operation_id, info.name, actual_size,
+            "operation=drive_upload stage=download_complete filename=%s bytes=%d",
+            info.name, actual_size,
         )
         final_path = safe_upload_path(
             settings.data_directory, info.name, source_prefix="drive"
@@ -1369,21 +1386,19 @@ async def _download_drive_upload(
             chat_id=update.effective_chat.id,
             status_message_id=status_message.message_id,
             source_kind="google_drive",
-            operation_id=operation_id,
         )
         await show_upload_header_selection(context, settings, job, status_message)
     except DriveAccessDenied as exc:
         temporary_path.unlink(missing_ok=True)
         LOGGER.warning(
-            "operation=drive_upload operation_id=%s stage=access_denied error_type=%s user_id=%s",
-            operation_id, type(exc).__name__, update.effective_user.id,
+            "operation=drive_upload stage=access_denied error_type=%s user_id=%s",
+            type(exc).__name__, update.effective_user.id,
         )
         await status_message.edit_text(
             progress_text(
                 "❌ دسترسی به فایل Drive ممکن نیست",
                 "مرحلهٔ بررسی دسترسی فایل",
                 100,
-                operation_id=operation_id,
                 detail=(
                     "در Google Drive، اشتراک‌گذاری را روی «هرکسی که لینک را دارد — مشاهده‌گر» بگذارید. "
                     "فایل خصوصی با روش فعلی قابل دریافت نیست."
@@ -1397,7 +1412,6 @@ async def _download_drive_upload(
                 "❌ حجم فایل بیش از سقف مجاز است",
                 "مرحلهٔ بررسی اندازهٔ فایل",
                 100,
-                operation_id=operation_id,
                 detail=f"حجم: {_human_bytes(exc.actual)}؛ سقف: {_human_bytes(exc.maximum)}",
             )
         )
@@ -1408,41 +1422,38 @@ async def _download_drive_upload(
                 "❌ فضای دیسک کافی نیست",
                 "مرحلهٔ بررسی فضای آزاد",
                 100,
-                operation_id=operation_id,
                 detail=f"حجم فایل: {_human_bytes(exc.required)}؛ فضای آزاد: {_human_bytes(exc.available)}",
             )
         )
     except DriveNotCsv as exc:
         temporary_path.unlink(missing_ok=True)
         LOGGER.warning(
-            "operation=drive_upload operation_id=%s stage=unsupported_file_type error_type=%s",
-            operation_id, type(exc).__name__,
+            "operation=drive_upload stage=unsupported_file_type error_type=%s",
+            type(exc).__name__,
         )
         await status_message.edit_text(progress_text(
             "❌ نوع فایل پشتیبانی نمی‌شود",
             "مرحلهٔ بررسی نوع فایل",
             100,
-            operation_id=operation_id,
             detail="این لینک به CSV یا TXT نمی‌رسد؛ Google Sheets/Docs را ابتدا به CSV تبدیل کنید.",
         ))
     except DriveDownloadError as exc:
         temporary_path.unlink(missing_ok=True)
         LOGGER.warning(
-            "operation=drive_upload operation_id=%s stage=download_failed error_type=%s user_id=%s",
-            operation_id, type(exc).__name__, update.effective_user.id,
+            "operation=drive_upload stage=download_failed error_type=%s user_id=%s",
+            type(exc).__name__, update.effective_user.id,
         )
         await status_message.edit_text(progress_text(
             "❌ دریافت فایل از Google Drive ناموفق بود",
             "مرحلهٔ دانلود Drive",
             100,
-            operation_id=operation_id,
             detail="دسترسی، لینک و اتصال اینترنت را بررسی کنید.",
         ))
     except Exception as exc:
         temporary_path.unlink(missing_ok=True)
         _log_exception_redacted(
-            "operation=drive_upload operation_id=%s stage=unexpected_failure user_id=%s error_type=%s"
-            % (operation_id, update.effective_user.id, type(exc).__name__),
+            "operation=drive_upload stage=unexpected_failure user_id=%s error_type=%s"
+            % (update.effective_user.id, type(exc).__name__),
             exc,
             reference.file_id,
             reference.resource_key,
@@ -1451,14 +1462,10 @@ async def _download_drive_upload(
             "❌ دریافت فایل از Google Drive ناموفق بود",
             "جزئیات و traceback در CMD ثبت شد",
             100,
-            operation_id=operation_id,
             detail="فایل ناقص حذف شد و ورود اطلاعات آغاز نشد.",
         ))
     finally:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-        context.user_data.pop("active_operation_id", None)
-
-
 async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Accept a Google Drive file-sharing link in a private Telegram chat."""
     settings: Settings = context.application.bot_data["settings"]
@@ -1483,26 +1490,22 @@ async def google_drive_link_upload(update: Update, context: ContextTypes.DEFAULT
     settings.data_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = safe_upload_path(settings.data_directory, "drive_upload.csv", source_prefix="drive")
     context.user_data[UPLOAD_TRANSFER_KEY] = "google_drive"
-    operation_id = new_operation_id()
-    context.user_data["active_operation_id"] = operation_id
     LOGGER.info(
-        "operation=drive_upload operation_id=%s stage=link_accepted user_id=%s",
-        operation_id, update.effective_user.id,
+        "operation=drive_upload stage=link_accepted user_id=%s",
+        update.effective_user.id,
     )
     try:
         status_message = await message.reply_text(progress_text(
             "🔎 لینک Drive بررسی شد",
             "آماده‌سازی دانلود",
             0,
-            operation_id=operation_id,
         ))
     except Exception:
         context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-        context.user_data.pop("active_operation_id", None)
         raise
     context.application.create_task(
         _download_drive_upload(
-            update, context, settings, reference, temporary_path, status_message, operation_id
+            update, context, settings, reference, temporary_path, status_message
         ),
         update=update,
         name="google-drive-csv-download",
@@ -1550,6 +1553,9 @@ def _admin_panel_text(settings: Settings) -> str:
         "تغییر نام هدر سراسری: /header_set NATIONAL_CODE = کد ملی\n"
         "دیدن نام‌های هدر: /header_aliases\n"
         "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n"
+        "مخفی‌کردن هدر در پیام و TXT: /header_hide NATIONAL_CODE\n"
+        "نمایش دوبارهٔ هدر: /header_show NATIONAL_CODE\n"
+        "دیدن فهرست هدرهای مخفی: /header_hidden\n"
         "آماده‌سازی دریافت از Google Drive: /drive_setup\n\n"
         "حالت عمومی فقط جست‌وجو را برای همه باز می‌کند؛ بارگذاری فایل همچنان فقط برای کاربران مجاز است."
     )
@@ -1788,18 +1794,15 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
         return
 
     if action == "delete":
-        operation_id = new_operation_id()
-        context.user_data["active_operation_id"] = operation_id
         LOGGER.info(
-            "operation=database_delete operation_id=%s stage=started user_id=%s file_id=%s",
-            operation_id, update.effective_user.id, file_id,
+            "operation=database_delete stage=started user_id=%s file_id=%s",
+            update.effective_user.id, file_id,
         )
         await callback.answer("حذف دیتاست آغاز شد.")
         await callback.edit_message_text(progress_text(
             "🗑️ حذف دیتاست",
             "آماده‌سازی حذف و آرشیو فایل خام",
             0,
-            operation_id=operation_id,
         ))
         loop = asyncio.get_running_loop()
         progress_queue: asyncio.Queue[tuple[str, float] | None] = asyncio.Queue()
@@ -1814,8 +1817,8 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
                 "حذف دیتاست کامل شد": "delete_complete",
             }.get(stage, "delete_progress")
             LOGGER.info(
-                "operation=database_delete operation_id=%s stage=%s progress=%.1f file_id=%s",
-                operation_id, stage_code, percent, file_id,
+                "operation=database_delete stage=%s progress=%.1f file_id=%s",
+                stage_code, percent, file_id,
             )
             loop.call_soon_threadsafe(progress_queue.put_nowait, (stage, percent))
 
@@ -1830,15 +1833,11 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
                         "🗑️ حذف دیتاست",
                         stage,
                         percent,
-                        operation_id=operation_id,
                     ))
                 except Exception:
-                    LOGGER.exception(
-                        "operation=database_delete operation_id=%s stage=progress_message_failed",
-                        operation_id,
-                    )
+                    LOGGER.exception("operation=database_delete stage=progress_message_failed")
 
-        progress_task = asyncio.create_task(consume_delete_progress(), name=f"delete-progress-{operation_id}")
+        progress_task = asyncio.create_task(consume_delete_progress(), name="delete-progress")
         delete_error: Exception | None = None
         result = None
         try:
@@ -1850,11 +1849,10 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
         finally:
             loop.call_soon_threadsafe(progress_queue.put_nowait, None)
             await progress_task
-            context.user_data.pop("active_operation_id", None)
         if delete_error is not None:
             _log_exception_redacted(
-                "operation=database_delete operation_id=%s stage=failed file_id=%s error_type=%s"
-                % (operation_id, file_id, type(delete_error).__name__),
+                "operation=database_delete stage=failed file_id=%s error_type=%s"
+                % (file_id, type(delete_error).__name__),
                 delete_error,
                 settings.telegram_bot_token,
             )
@@ -1863,7 +1861,6 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
                     "❌ حذف انجام نشد",
                     "اطلاعات دیتابیس بررسی و در صورت نیاز CSV بازگردانده شد",
                     100,
-                    operation_id=operation_id,
                     detail="جزئیات فنی در CMD ثبت شده است.",
                 ),
                 reply_markup=InlineKeyboardMarkup([[
@@ -1876,7 +1873,6 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
                 "⚪ فایل دیگر در پایگاه‌داده نیست",
                 "عملیات پایان یافت",
                 100,
-                operation_id=operation_id,
             ))
             return
         deleted, archived_path = result
@@ -1893,15 +1889,14 @@ async def database_management_callback(update: Update, context: ContextTypes.DEF
             notice += "\nفایل خام پیدا نشد؛ فقط اطلاعات پایگاه‌داده حذف شد."
         text, keyboard = _database_list_view(settings, page)
         LOGGER.info(
-            "operation=database_delete operation_id=%s stage=complete file_id=%s deleted_rows=%s",
-            operation_id, file_id, deleted["record_count"],
+            "operation=database_delete stage=complete file_id=%s deleted_rows=%s",
+            file_id, deleted["record_count"],
         )
         await callback.edit_message_text(
             progress_text(
                 "✅ حذف دیتاست کامل شد",
                 "فایل خام در آرشیو نگه‌داری شد و از نتایج حذف شد",
                 100,
-                operation_id=operation_id,
             ) + f"\n\n{notice}\n\n{text}",
             reply_markup=keyboard,
         )
@@ -2079,34 +2074,87 @@ async def header_remove_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def header_hide_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    text = update.effective_message.text or ""
+    _, _, source = text.partition(" ")
+    if not source.strip():
+        await update.effective_message.reply_text("روش درست: /header_hide NATIONAL_CODE")
+        return
+    connection = connect(settings.database_path)
+    try:
+        changed = hide_header(connection, source.strip())
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"هدر «{source.strip()}» از این پس در پیام نتایج و فایل TXT نمایش داده نمی‌شود."
+        if changed else f"هدر «{source.strip()}» از قبل مخفی بوده است."
+    )
+
+
+async def header_show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    text = update.effective_message.text or ""
+    _, _, source = text.partition(" ")
+    if not source.strip():
+        await update.effective_message.reply_text("روش درست: /header_show NATIONAL_CODE")
+        return
+    connection = connect(settings.database_path)
+    try:
+        changed = show_header(connection, source.strip())
+    finally:
+        connection.close()
+    await update.effective_message.reply_text(
+        f"نمایش هدر «{source.strip()}» دوباره فعال شد."
+        if changed else f"هدر «{source.strip()}» در فهرست هدرهای مخفی نبود."
+    )
+
+
+async def hidden_headers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_admin(update, settings):
+        return
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        headers = list_hidden_headers(connection)
+    finally:
+        connection.close()
+    if not headers:
+        await update.effective_message.reply_text("هیچ هدری مخفی نشده است.")
+        return
+    await update.effective_message.reply_text(
+        "هدرهای مخفی‌شده (نام اصلی ستون):\n" + "\n".join(f"• {header}" for header in headers)
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
-    operation_id = new_operation_id()
-    context.user_data["active_operation_id"] = operation_id
     LOGGER.info(
-        "operation=stats operation_id=%s stage=started user_id=%s",
-        operation_id, update.effective_user.id,
+        "operation=stats stage=started user_id=%s",
+        update.effective_user.id,
     )
     status = await update.effective_message.reply_text(progress_text(
         "📊 دریافت آمار پایگاه‌داده",
         "آماده‌سازی خواندن آمار",
         0,
-        operation_id=operation_id,
     ))
     try:
         await status.edit_text(progress_text(
             "📊 دریافت آمار پایگاه‌داده",
             "در حال خواندن وضعیت و اندازهٔ دیتابیس",
             50,
-            operation_id=operation_id,
         ))
         statistics = await asyncio.to_thread(run_stats, settings)
     except Exception as exc:
         _log_exception_redacted(
-            "operation=stats operation_id=%s stage=failed user_id=%s error_type=%s"
-            % (operation_id, update.effective_user.id, type(exc).__name__),
+            "operation=stats stage=failed user_id=%s error_type=%s"
+            % (update.effective_user.id, type(exc).__name__),
             exc,
             settings.telegram_bot_token,
         )
@@ -2114,18 +2162,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "❌ دریافت آمار ناموفق بود",
             "جزئیات در CMD ثبت شد",
             100,
-            operation_id=operation_id,
         ))
-        context.user_data.pop("active_operation_id", None)
         return
     size_mib = float(statistics["database_bytes"]) / (1024 * 1024)
     LOGGER.info(
-        "operation=stats operation_id=%s stage=complete records=%s completed_files=%s failed_files=%s database_bytes=%s",
-        operation_id, statistics["records"], statistics["completed_files"],
+        "operation=stats stage=complete records=%s completed_files=%s failed_files=%s database_bytes=%s",
+        statistics["records"], statistics["completed_files"],
         statistics["failed_files"], statistics["database_bytes"],
     )
     await status.edit_text(
-        progress_text("✅ آمار آماده شد", "پایان", 100, operation_id=operation_id)
+        progress_text("✅ آمار آماده شد", "پایان", 100)
         + "\n\n<b>آمار پایگاه داده</b>\n"
         f"تعداد کل ردیف‌ها: {statistics['records']:,}\n"
         f"فایل‌های کامل‌شده: {statistics['completed_files']:,}\n"
@@ -2137,25 +2183,20 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"شاخص‌های جست‌وجو آماده‌اند: {'بله' if statistics['search_indexes_ready'] else 'خیر'}",
         parse_mode=ParseMode.HTML,
     )
-    context.user_data.pop("active_operation_id", None)
-
-
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Capture unhandled update/task failures with enough context to diagnose them."""
     error = context.error
     if error is None:
         return
     settings = context.application.bot_data.get("settings")
-    user_data = getattr(context, "user_data", None)
-    operation_id = user_data.get("active_operation_id", "-") if isinstance(user_data, dict) else "-"
     effective_user = getattr(update, "effective_user", None)
     effective_chat = getattr(update, "effective_chat", None)
     update_id = getattr(update, "update_id", "-")
     user_id = getattr(effective_user, "id", "-")
     chat_id = getattr(effective_chat, "id", "-")
     _log_exception_redacted(
-        "operation=telegram_update operation_id=%s stage=unhandled_exception update_id=%s user_id=%s chat_id=%s error_type=%s"
-        % (operation_id, update_id, user_id, chat_id, type(error).__name__),
+        "operation=telegram_update stage=unhandled_exception update_id=%s user_id=%s chat_id=%s error_type=%s"
+        % (update_id, user_id, chat_id, type(error).__name__),
         error,
         getattr(settings, "telegram_bot_token", None),
     )
@@ -2201,30 +2242,26 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await callback.answer("این صفحه‌ی نتیجه منقضی شده است؛ دوباره جست‌وجو کنید.", show_alert=True)
         return
     await callback.answer()
-    operation_id = new_operation_id()
-    context.user_data["active_operation_id"] = operation_id
     LOGGER.info(
-        "operation=pagination operation_id=%s stage=started user_id=%s page=%d query_length=%d",
-        operation_id, update.effective_user.id, page + 1, len(session.query),
+        "operation=pagination stage=started user_id=%s page=%d query_length=%d",
+        update.effective_user.id, page + 1, len(session.query),
     )
     await callback.edit_message_text(progress_text(
         "📄 صفحه‌بندی نتیجه‌ها",
         "آماده‌سازی صفحهٔ بعد",
         0,
-        operation_id=operation_id,
     ))
     try:
         await callback.edit_message_text(progress_text(
             "📄 صفحه‌بندی نتیجه‌ها",
             "در حال جست‌وجوی صفحه در دیتابیس",
             35,
-            operation_id=operation_id,
         ))
         result = await asyncio.to_thread(run_search, settings, session.query, page)
     except Exception as exc:
         _log_exception_redacted(
-            "operation=pagination operation_id=%s stage=search_failed user_id=%s page=%d error_type=%s"
-            % (operation_id, update.effective_user.id, page + 1, type(exc).__name__),
+            "operation=pagination stage=search_failed user_id=%s page=%d error_type=%s"
+            % (update.effective_user.id, page + 1, type(exc).__name__),
             exc,
             settings.telegram_bot_token,
         )
@@ -2232,46 +2269,54 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "❌ بارگذاری صفحه ناموفق بود",
             "جزئیات در CMD ثبت شد",
             100,
-            operation_id=operation_id,
         ))
-        context.user_data.pop("active_operation_id", None)
         return
     visible_total = min(result.total_count, settings.max_results)
     if not result.rows or page * settings.results_per_page >= visible_total:
         await callback.answer("نتیجه‌ی دیگری نیست.", show_alert=True)
-        context.user_data.pop("active_operation_id", None)
         return
-    needs_full_csv = page_needs_full_csv(result, settings)
+    aliases, hidden_headers = await asyncio.gather(
+        asyncio.to_thread(load_display_header_aliases, settings),
+        asyncio.to_thread(load_hidden_header_keys, settings),
+    )
+    needs_full_csv = page_needs_full_csv(result, settings, hidden_headers)
     LOGGER.info(
-        "operation=pagination operation_id=%s stage=query_complete page=%d results=%d full_csv=%s",
-        operation_id, page + 1, len(result.rows), needs_full_csv,
+        "operation=pagination stage=query_complete page=%d results=%d full_csv=%s",
+        page + 1, len(result.rows), needs_full_csv,
     )
     await callback.edit_message_text(
-        progress_text("✅ صفحه آماده شد", "در حال نمایش نتیجه‌ها", 100, operation_id=operation_id)
-        + "\n\n"
-        + format_page(session.query, page, result, settings, full_csv_attached=needs_full_csv),
+        progress_text("✅ صفحه آماده شد", "در حال نمایش نتیجه‌ها", 100)
+        + "\n"
+        + format_page(
+            session.query,
+            page,
+            result,
+            settings,
+            full_csv_attached=needs_full_csv,
+            header_aliases=aliases,
+            hidden_headers=hidden_headers,
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=pagination_keyboard(token, page, result.total_count, settings),
         disable_web_page_preview=True,
     )
     if needs_full_csv:
         LOGGER.info(
-            "operation=pagination operation_id=%s stage=full_csv_send_started page=%d",
-            operation_id, page + 1,
+            "operation=pagination stage=full_csv_send_started page=%d",
+            page + 1,
         )
         await context.bot.send_document(
             chat_id=callback.message.chat_id,
-            document=io.BytesIO(full_results_csv_bytes(session.query, page, result)),
+            document=io.BytesIO(
+                full_results_csv_bytes(session.query, page, result, aliases, hidden_headers)
+            ),
             filename=f"نتایج_جست‌وجو_{page + 1}.csv",
             caption="همه‌ی فیلدهای اصلی ردیف‌های نتیجه.",
         )
         LOGGER.info(
-            "operation=pagination operation_id=%s stage=full_csv_send_complete page=%d",
-            operation_id, page + 1,
+            "operation=pagination stage=full_csv_send_complete page=%d",
+            page + 1,
         )
-    context.user_data.pop("active_operation_id", None)
-
-
 def main() -> None:
     global LOGGER
     instance_lock = None
@@ -2331,7 +2376,6 @@ def main() -> None:
     application.bot_data["upload_manager"] = manager
     application.add_handler(TypeHandler(Update, log_update_received), group=-1)
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("database", database_management_command))
@@ -2342,6 +2386,9 @@ def main() -> None:
     application.add_handler(CommandHandler("header_set", header_set_command))
     application.add_handler(CommandHandler("header_aliases", header_aliases_command))
     application.add_handler(CommandHandler("header_remove", header_remove_command))
+    application.add_handler(CommandHandler("header_hide", header_hide_command))
+    application.add_handler(CommandHandler("header_show", header_show_command))
+    application.add_handler(CommandHandler("header_hidden", hidden_headers_command))
     application.add_handler(CommandHandler("drive_setup", drive_setup_command))
     application.add_handler(CallbackQueryHandler(database_management_callback, pattern=r"^db:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
