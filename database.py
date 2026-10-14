@@ -5,12 +5,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import sqlite3
+import time
 from typing import Iterator, Sequence
 
 from config import Settings
 
 SCHEMA_VERSION = "4"
+LOGGER = logging.getLogger("telegram_csv_search")
+SQLITE_WRITE_TIMEOUT_SECONDS = 120
+SQLITE_BUSY_TIMEOUT_MS = 120_000
+INDEX_BUILD_RETRIES = 4
+INDEX_RETRY_DELAYS_SECONDS = (1, 2, 4)
 
 
 class DatabaseRebuildRequired(RuntimeError):
@@ -38,10 +45,10 @@ def connect(database_path: Path, *, readonly: bool = False) -> sqlite3.Connectio
         connection = sqlite3.connect(uri, uri=True, timeout=15)
     else:
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path, timeout=30)
+        connection = sqlite3.connect(database_path, timeout=SQLITE_WRITE_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 15000")
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     if not readonly:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
@@ -317,21 +324,42 @@ def build_search_indexes(connection: sqlite3.Connection, *, force: bool = False)
     """Build exact/prefix B-tree indexes and rebuild FTS after an initial bulk import."""
     if search_indexes_ready(connection) and not force:
         return
-    connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
-    connection.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_records_phone_norm ON records(phone_norm);
-        CREATE INDEX IF NOT EXISTS idx_records_column_1_norm ON records(column_1_norm);
-        CREATE INDEX IF NOT EXISTS idx_records_column_2_norm ON records(column_2_norm);
-        CREATE INDEX IF NOT EXISTS idx_records_name_norm ON records(name_norm);
-        CREATE INDEX IF NOT EXISTS idx_records_birth_date_norm ON records(birth_date_norm);
-        CREATE INDEX IF NOT EXISTS idx_records_record_hash ON records(record_hash);
-        """
+    index_statements = (
+        "CREATE INDEX IF NOT EXISTS idx_records_phone_norm ON records(phone_norm)",
+        "CREATE INDEX IF NOT EXISTS idx_records_column_1_norm ON records(column_1_norm)",
+        "CREATE INDEX IF NOT EXISTS idx_records_column_2_norm ON records(column_2_norm)",
+        "CREATE INDEX IF NOT EXISTS idx_records_name_norm ON records(name_norm)",
+        "CREATE INDEX IF NOT EXISTS idx_records_birth_date_norm ON records(birth_date_norm)",
+        "CREATE INDEX IF NOT EXISTS idx_records_record_hash ON records(record_hash)",
     )
-    if force:
-        connection.execute("REINDEX")
-    set_metadata(connection, "search_indexes_ready", "1")
-    connection.commit()
+    for attempt in range(INDEX_BUILD_RETRIES):
+        try:
+            # Acquire SQLite's single-writer slot before doing the expensive FTS rebuild.
+            # Re-check after acquiring it so concurrent initializers do not rebuild twice.
+            connection.execute("BEGIN IMMEDIATE")
+            if search_indexes_ready(connection) and not force:
+                connection.commit()
+                return
+            connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
+            for statement in index_statements:
+                connection.execute(statement)
+            if force:
+                connection.execute("REINDEX")
+            set_metadata(connection, "search_indexes_ready", "1")
+            connection.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            connection.rollback()
+            message = str(exc).lower()
+            is_lock_error = "locked" in message or "busy" in message
+            if not is_lock_error or attempt + 1 >= INDEX_BUILD_RETRIES:
+                raise
+            delay = INDEX_RETRY_DELAYS_SECONDS[min(attempt, len(INDEX_RETRY_DELAYS_SECONDS) - 1)]
+            LOGGER.warning(
+                "SQLite remained busy while building search indexes; retry=%d/%d delay_seconds=%d",
+                attempt + 1, INDEX_BUILD_RETRIES, delay,
+            )
+            time.sleep(delay)
 
 
 def get_imported_file(connection: sqlite3.Connection, relative_path: str) -> ImportedFile | None:

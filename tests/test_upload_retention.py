@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+import sqlite3
 import unittest
+from unittest.mock import patch
 
 from config import Settings
 from database import connect
@@ -82,6 +84,72 @@ class UploadRetentionTests(unittest.IsolatedAsyncioTestCase):
                 result = search_records(connection, "نگار", 0, settings)
                 self.assertEqual(result.total_count, 1)
                 self.assertEqual(result.rows[0]["phone"], "09120000000")
+            finally:
+                connection.close()
+
+    async def test_index_lock_after_import_does_not_claim_file_import_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            source = data / "completed-data.csv"
+            source.write_text("id,name\n1,نگار\n", encoding="utf-8-sig")
+            settings = Settings(
+                telegram_bot_token="unused",
+                allowed_user_ids=frozenset({1}),
+                data_directory=data,
+                database_path=root / "database" / "search.db",
+                log_directory=root / "logs",
+                csv_delimiter=",",
+                csv_encoding="utf-8-sig",
+                csv_has_header=True,
+                csv_column_names=("column_1", "column_2", "name", "birth_date", "phone"),
+                duplicate_mode="keep",
+                import_batch_size=100,
+                import_progress_every_rows=1000,
+                max_results=100,
+                results_per_page=10,
+                max_query_length=160,
+                max_field_display_chars=280,
+                phone_normalization=True,
+                prefix_search_min_length=3,
+                log_level="INFO",
+                upload_enabled=True,
+                upload_max_bytes=3_000_000_000,
+                upload_progress_interval_seconds=3,
+                delete_csv_after_import=False,
+                telegram_base_url="https://api.telegram.org/bot",
+                telegram_file_base_url="https://api.telegram.org/file/bot",
+            )
+            bot = _FakeBot()
+            manager = UploadManager(settings, bot)  # type: ignore[arg-type]
+            with patch(
+                "upload_manager.build_search_indexes",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                await manager._process(
+                    UploadJob(
+                        path=source,
+                        original_filename="completed-data.csv",
+                        file_id="file-id-2",
+                        file_unique_id="unique-id-2",
+                        file_size=source.stat().st_size,
+                        uploader_id=1,
+                        chat_id=1,
+                        status_message_id=1,
+                    ),
+                    1,
+                )
+
+            self.assertTrue(any("ردیف‌های فایل" in text and "وارد شدند" in text for text in bot.edits))
+            self.assertTrue(any("فایل را دوباره نفرستید" in text for text in bot.edits))
+            self.assertFalse(any("ورود اطلاعات فایل" in text and "ناموفق بود" in text for text in bot.edits))
+            connection = connect(settings.database_path, readonly=True)
+            try:
+                status = connection.execute(
+                    "SELECT status FROM imported_files WHERE relative_path = 'completed-data.csv'"
+                ).fetchone()[0]
+                self.assertEqual(status, "completed")
             finally:
                 connection.close()
 

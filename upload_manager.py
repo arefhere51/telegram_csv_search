@@ -158,8 +158,15 @@ class UploadManager:
                     progress_callback=progress,
                     selected_column_indices=job.selected_column_indices,
                 )
-                build_search_indexes(connection)
                 return processed, inserted
+            finally:
+                connection.close()
+
+        def build_indexes_sync() -> None:
+            connection = connect(self.settings.database_path)
+            try:
+                initialize_database(connection)
+                build_search_indexes(connection)
             finally:
                 connection.close()
 
@@ -171,6 +178,24 @@ class UploadManager:
                 job,
                 f"❌ ورود اطلاعات فایل {job.original_filename} ناموفق بود.\n"
                 "جزئیات فنی در گزارش سرور ثبت شد؛ فایل روی سرور نگه داشته شد.",
+            )
+            return
+
+        await self._edit_status(
+            job,
+            f"⏳ ورود ردیف‌ها کامل شد؛ در حال آماده‌سازی شاخص جست‌وجو برای {job.original_filename}...",
+        )
+        try:
+            await asyncio.to_thread(build_indexes_sync)
+        except Exception:
+            LOGGER.exception(
+                "CSV rows were imported but search index initialization failed filename=%s rows=%d",
+                job.original_filename, processed,
+            )
+            await self._edit_status(
+                job,
+                f"⚠️ ردیف‌های فایل {job.original_filename} وارد شدند، اما آماده‌سازی جست‌وجو کامل نشد. "
+                "فایل را دوباره نفرستید؛ برای جلوگیری از رکورد تکراری، شاخص‌ها باید تعمیر شوند.",
             )
             return
 
