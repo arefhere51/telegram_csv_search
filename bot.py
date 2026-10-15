@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 import httpx
 from telegram import (
     BotCommand,
-    BotCommandScopeChatMember,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -1960,7 +1960,9 @@ def _admin_bot_commands(*, primary_admin: bool) -> list[BotCommand]:
 
 
 async def _sync_user_command_scope(bot, user_id: int, settings: Settings, *, remove_admin: bool = False) -> None:
-    scope = BotCommandScopeChatMember(chat_id=int(user_id), user_id=int(user_id))
+    # BotCommandScopeChatMember is only valid for group/supergroup members.
+    # This bot uses private chats, so Telegram requires a chat-specific scope.
+    scope = BotCommandScopeChat(chat_id=int(user_id))
     try:
         if remove_admin:
             await bot.delete_my_commands(scope=scope)
