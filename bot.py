@@ -1031,26 +1031,27 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         cancellation_note += "\nانتخاب ستون فایل ناتمام لغو شد و فایل موقت آن پاک شد."
     if not cancellation_note:
         cancellation_note = "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت."
+    user = update.effective_user
+    display_name = (
+        getattr(user, "first_name", None)
+        or getattr(user, "username", None)
+        or str(user_id)
+    ).strip()
     lines = [
-        "سلام. عبارت موردنظرتان را همین‌جا بفرستید یا از /search <عبارت> استفاده کنید.",
-        "ربات در ستون‌هایی می‌گردد که هنگام افزودن فایل برای جست‌وجو انتخاب شده‌اند، اما نتیجه، اطلاعات کامل همان ردیف را نشان می‌دهد.",
-        "تا ۵ نتیجه در پیام نمایش داده می‌شود؛ اگر بیشتر باشد، فایل TXT فرستاده می‌شود. خروجی TXT حداکثر ۲۰۰۰ ردیف دارد؛ برای نتیجه‌های بیشتر عبارت را دقیق‌تر کنید.",
-        "برای دیدن آمار از /stats استفاده کنید. اگر پردازشی برایتان در حال انجام است، /start درخواست‌های جست‌وجوی شما را لغو می‌کند.",
+        f"👋 سلام {display_name} عزیز، خوش آمدید!",
+        "",
+        "🎯 امکانات سامانه:",
+        " ▫️ جستجو اطلاعات براساس نام، شماره موبایل و کدملی",
+        " ▫️ پردازش پرسرعت و اولویت‌بندی شده در صف",
+        "",
+        "برای جستجو، لطفا شماره موبایل یا کدملی یا نام فرد را بطور کامل ارسال کنید",
     ]
-    if upload_authorized(update, settings):
-        lines.append(
-            "برای افزودن داده، فایل CSV/TXT را در گفت‌وگوی خصوصی بفرستید یا لینک اشتراک‌گذاری فایل CSV/TXT در Google Drive را ارسال کنید."
-        )
-    else:
-        lines.append("ارسال فایل برای مدیران و کاربران ثبت‌شده فعال است.")
-    if is_admin(user_id, settings):
-        lines.append("برای دیدن پنل مدیریت و دسته‌بندی ابزارها از /admin استفاده کنید.")
-    lines.extend(["", cancellation_note])
+    if cancellation_note != "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت.":
+        lines.extend(["", cancellation_note])
     await update.effective_message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 شروع جست‌وجو", callback_data="g:start")],
-            [InlineKeyboardButton("📖 راهنما", callback_data="g:help")],
             [InlineKeyboardButton("❌ لغو عملیات", callback_data="g:cancel")],
         ]),
     )
@@ -1086,8 +1087,6 @@ async def guided_search_callback(update: Update, context: ContextTypes.DEFAULT_T
         await callback.message.reply_text(
             "🔍 عبارت جست‌وجو را بفرستید.\nمثال: علی یا 0912\nبرای لغو، /start را بفرستید."
         )
-    elif action == "help":
-        await help_command(update, context)
     elif action == "cancel":
         context.user_data.pop(GUIDED_SEARCH_KEY, None)
         await callback.message.reply_text("عملیات راهنما لغو شد.")
@@ -2055,7 +2054,6 @@ async def _deny_non_primary_admin(update: Update, settings: Settings) -> bool:
 def _user_bot_commands() -> list[BotCommand]:
     return [
         BotCommand("start", "راهنمای استفاده و لغو درخواست جاری"),
-        BotCommand("help", "راهنمای استفاده از ربات"),
     ]
 
 
@@ -3090,7 +3088,6 @@ def main() -> None:
     application.add_handler(TypeHandler(Update, search_busy_guard), group=-2)
     application.add_handler(TypeHandler(Update, log_update_received), group=-1)
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("database", database_management_command))
