@@ -1039,6 +1039,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text("\n".join(lines))
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user guide without treating /help as a cancellation request."""
+    settings: Settings = context.application.bot_data["settings"]
+    if await deny_if_unauthorized(update, settings):
+        return
+    lines = [
+        "راهنمای استفاده از FinderBot",
+        "عبارت جست‌وجو را مستقیماً بفرستید یا از /search <عبارت> استفاده کنید.",
+        "ربات در ستون‌هایی می‌گردد که هنگام افزودن فایل برای جست‌وجو انتخاب شده‌اند، اما نتیجه اطلاعات کامل همان ردیف را نشان می‌دهد.",
+        "برای لغو جست‌وجوی جاری یا دانلود فایل، /start را بفرستید.",
+    ]
+    if upload_authorized(update, settings):
+        lines.append("برای افزودن داده، فایل CSV/TXT یا لینک اشتراک‌گذاری Google Drive را در گفت‌وگوی خصوصی بفرستید.")
+    if is_admin(update.effective_user.id, settings):
+        lines.append("برای دیدن راهنمای کامل مدیریت و دستورات مدیریتی، /admin را بفرستید.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
@@ -1973,8 +1991,7 @@ async def _deny_non_primary_admin(update: Update, settings: Settings) -> bool:
 def _user_bot_commands() -> list[BotCommand]:
     return [
         BotCommand("start", "راهنمای استفاده و لغو درخواست جاری"),
-        BotCommand("search", "جست‌وجو با عبارت دلخواه"),
-        BotCommand("stats", "آمار پایگاه‌داده"),
+        BotCommand("help", "راهنمای استفاده از ربات"),
     ]
 
 
@@ -2018,7 +2035,7 @@ async def _sync_user_command_scope(bot, user_id: int, settings: Settings, *, rem
 
 
 async def _sync_bot_command_menus(bot, settings: Settings) -> None:
-    """Publish ordinary commands by default and elevated commands only per admin."""
+    """Publish only basic commands publicly and elevated commands per admin chat."""
     try:
         await bot.set_my_commands(_user_bot_commands(), scope=BotCommandScopeDefault())
     except Exception:
@@ -2932,6 +2949,7 @@ def main() -> None:
     application.add_handler(TypeHandler(Update, search_busy_guard), group=-2)
     application.add_handler(TypeHandler(Update, log_update_received), group=-1)
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("database", database_management_command))

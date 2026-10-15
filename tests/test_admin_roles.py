@@ -45,8 +45,9 @@ class AdminConfigurationTests(unittest.TestCase):
 
     def test_default_command_menu_exposes_no_admin_or_help_commands(self) -> None:
         commands = {item.command for item in _user_bot_commands()}
-        self.assertEqual(commands, {"start", "search", "stats"})
-        self.assertNotIn("help", commands)
+        self.assertEqual(commands, {"start", "help"})
+        self.assertNotIn("search", commands)
+        self.assertNotIn("stats", commands)
         admin_commands = {item.command for item in _admin_bot_commands(primary_admin=False)}
         self.assertIn("admin", admin_commands)
         self.assertNotIn("admin_add", admin_commands)
