@@ -41,12 +41,17 @@ class SearchQueue:
         if user_id is None:
             return False
         return bool(
-            (
-                self._active
-                and self._active.user_id == user_id
-                and not self._active.cancel_event.is_set()
-            )
+            (self._active and self._active.user_id == user_id)
             or user_id in self._pending_by_user
+        )
+
+    def is_user_cancelling(self, user_id: int | None) -> bool:
+        """Return whether the user's active search was signalled for cancellation."""
+        return bool(
+            user_id is not None
+            and self._active
+            and self._active.user_id == user_id
+            and self._active.cancel_event.is_set()
         )
 
     @property
@@ -70,10 +75,16 @@ class SearchQueue:
             )
             return False
         if self.is_user_busy(user_id):
-            await message.reply_text(
-                "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
-                "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
-            )
+            if self.is_user_cancelling(user_id):
+                await message.reply_text(
+                    "لغو جست‌وجوی قبلی هنوز کامل نشده است؛ این درخواست ثبت یا وارد صف نشد. "
+                    "بعد از پایان لغو، دوباره جست‌وجو کنید."
+                )
+            else:
+                await message.reply_text(
+                    "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
+                    "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
+                )
             LOGGER.info("operation=search_queue stage=duplicate_rejected user_id=%s", user_id)
             return False
 

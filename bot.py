@@ -298,10 +298,16 @@ async def search_busy_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             LOGGER.exception("operation=search_queue stage=callback_busy_alert_failed user_id=%s", user_id)
     elif message:
-        await message.reply_text(
-            "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
-            "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
-        )
+        if queue is not None and queue.is_user_cancelling(user_id):
+            await message.reply_text(
+                "لغو جست‌وجوی قبلی هنوز کامل نشده است؛ این درخواست ثبت یا وارد صف نشد. "
+                "بعد از پایان لغو، دوباره جست‌وجو کنید."
+            )
+        else:
+            await message.reply_text(
+                "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
+                "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
+            )
     raise ApplicationHandlerStop
 
 
