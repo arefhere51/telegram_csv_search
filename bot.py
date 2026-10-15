@@ -410,12 +410,14 @@ def write_search_text_exports(
     progress_callback: Callable[[int, int], None] | None = None,
     max_results: int | None = None,
     hidden_headers: set[str] | None = None,
+    cancellation_event: Event | None = None,
 ) -> list[Path]:
     """Stream up to max_results matching records to bounded UTF-8 TXT chunks."""
     if page_size < 1 or max_chunk_bytes < 4:
         raise ValueError("page_size must be positive and max_chunk_bytes must be at least 4.")
     export_settings = replace(settings, results_per_page=page_size)
-    first = run_search(export_settings, query, 0)
+    check_search_cancellation(cancellation_event)
+    first = run_search(export_settings, query, 0, cancellation_event=cancellation_event)
     total = first.total_count
     export_total = min(total, max_results) if max_results is not None else total
     if export_total <= 0:
@@ -463,11 +465,18 @@ def write_search_text_exports(
 
     try:
         for page in range(math.ceil(export_total / page_size)):
+            check_search_cancellation(cancellation_event)
             result = first if page == 0 else run_search(
-                export_settings, query, page, mode=first.mode, count_total=False
+                export_settings,
+                query,
+                page,
+                mode=first.mode,
+                count_total=False,
+                cancellation_event=cancellation_event,
             )
             page_rows = result.rows[: max(0, export_total - page * page_size)]
             for offset, row in enumerate(page_rows):
+                check_search_cancellation(cancellation_event)
                 record = format_full_text_record(
                     row, page * page_size + offset + 1, header_aliases, hidden_headers
                 ).encode("utf-8")
@@ -615,19 +624,38 @@ def run_search(
     *,
     mode: str | None = None,
     count_total: bool = True,
+    cancellation_event: Event | None = None,
 ) -> SearchPage:
     """Run a query in a worker thread with its own short-lived read-only connection."""
     effective_settings = replace(settings, results_per_page=page_size) if page_size else settings
     # Hydration reads the source CSV after querying SQLite. Keep the lock until
     # hydration is complete so deletion cannot move the source in between.
-    with DATABASE_OPERATION_LOCK:
+    acquired = False
+    while not acquired:
+        check_search_cancellation(cancellation_event)
+        acquired = DATABASE_OPERATION_LOCK.acquire(timeout=0.1)
+    try:
         connection = connect(settings.database_path, readonly=True)
         try:
-            return search_records(
-                connection, query, page, effective_settings, mode=mode, count_total=count_total
-            )
+            if cancellation_event is not None:
+                connection.set_progress_handler(
+                    lambda: 1 if cancellation_event.is_set() else 0,
+                    1000,
+                )
+            try:
+                return search_records(
+                    connection, query, page, effective_settings, mode=mode, count_total=count_total
+                )
+            except sqlite3.OperationalError as exc:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise SearchCancelled from exc
+                raise
         finally:
+            if cancellation_event is not None:
+                connection.set_progress_handler(None, 0)
             connection.close()
+    finally:
+        DATABASE_OPERATION_LOCK.release()
 
 
 def run_stats(settings: Settings) -> dict[str, object]:
@@ -682,7 +710,14 @@ async def respond_to_search(
             "در حال جست‌وجو در شاخص‌های پایگاه‌داده",
             20,
         ))
-        result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
+        result = await asyncio.to_thread(
+            run_search,
+            settings,
+            query,
+            0,
+            SEARCH_PREVIEW_LIMIT,
+            cancellation_event=cancellation_event,
+        )
         check_search_cancellation(cancellation_event)
         elapsed_ms = (time.perf_counter() - started) * 1000
         LOGGER.info(
@@ -825,6 +860,7 @@ async def respond_to_search(
                     progress_callback=export_progress,
                     max_results=SEARCH_EXPORT_MAX_RECORDS,
                     hidden_headers=hidden_headers,
+                    cancellation_event=cancellation_event,
                 )
                 check_search_cancellation(cancellation_event)
                 await stop_export_progress()
