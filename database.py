@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import logging
 import sqlite3
+from threading import RLock
 import time
 from typing import Callable, Iterator, Sequence
 
@@ -16,6 +17,7 @@ SCHEMA_VERSION = "6"
 LOGGER = logging.getLogger("telegram_csv_search")
 SQLITE_WRITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = 120_000
+DATABASE_OPERATION_LOCK = RLock()
 INDEX_BUILD_RETRIES = 4
 INDEX_RETRY_DELAYS_SECONDS = (1, 2, 4)
 INDEX_PROGRESS_HANDLER_INTERVAL_OPS = 20_000
@@ -239,17 +241,18 @@ def set_metadata(connection: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def initialize_access_control(connection: sqlite3.Connection, settings: Settings) -> None:
-    """Seed private-mode users once; later changes made by admins remain persistent."""
+    """Seed configured users without removing users managed from inside the bot."""
     mode = get_metadata(connection, "access_mode")
     if mode not in {"private", "public"}:
         set_metadata(connection, "access_mode", settings.initial_access_mode)
-    if get_metadata(connection, "access_bootstrap_done") != "1":
-        for user_id in sorted(settings.allowed_user_ids | settings.admin_user_ids):
-            connection.execute(
-                "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
-                (user_id, 0, utc_now()),
-            )
-        set_metadata(connection, "access_bootstrap_done", "1")
+    # Reconcile additions from .env on every startup. Existing database-managed
+    # users are deliberately not removed when an environment variable changes.
+    for user_id in sorted(settings.allowed_user_ids | settings.admin_user_ids):
+        connection.execute(
+            "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
+            (user_id, 0, utc_now()),
+        )
+    set_metadata(connection, "access_bootstrap_done", "1")
     connection.commit()
 
 

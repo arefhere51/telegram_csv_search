@@ -172,6 +172,10 @@ class Settings:
             raise ConfigurationError("DUPLICATE_MODE must be either keep or exact.")
         if settings.upload_progress_interval_seconds <= 0:
             raise ConfigurationError("UPLOAD_PROGRESS_INTERVAL_SECONDS must be greater than zero.")
+        if settings.delete_csv_after_import:
+            raise ConfigurationError(
+                "DELETE_CSV_AFTER_IMPORT cannot be enabled: search results are hydrated from the source CSV."
+            )
         if not settings.telegram_base_url or not settings.telegram_file_base_url:
             raise ConfigurationError("Telegram API base URLs cannot be empty.")
         if settings.initial_access_mode not in {"private", "public"}:

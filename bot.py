@@ -57,6 +57,7 @@ from google_drive import (
     parse_drive_share_link,
 )
 from database import (
+    DATABASE_OPERATION_LOCK,
     access_mode as db_access_mode,
     add_bot_admin,
     add_bot_user,
@@ -611,13 +612,16 @@ def run_search(
 ) -> SearchPage:
     """Run a query in a worker thread with its own short-lived read-only connection."""
     effective_settings = replace(settings, results_per_page=page_size) if page_size else settings
-    connection = connect(settings.database_path, readonly=True)
-    try:
-        return search_records(
-            connection, query, page, effective_settings, mode=mode, count_total=count_total
-        )
-    finally:
-        connection.close()
+    # Hydration reads the source CSV after querying SQLite. Keep the lock until
+    # hydration is complete so deletion cannot move the source in between.
+    with DATABASE_OPERATION_LOCK:
+        connection = connect(settings.database_path, readonly=True)
+        try:
+            return search_records(
+                connection, query, page, effective_settings, mode=mode, count_total=count_total
+            )
+        finally:
+            connection.close()
 
 
 def run_stats(settings: Settings) -> dict[str, object]:
@@ -1040,6 +1044,7 @@ async def download_file_with_progress(
     message_id: int,
     filename: str,
     total_bytes: int | None,
+    cancellation_event: Event | None = None,
 ) -> None:
     """Stream a Telegram file to disk and edit one status message periodically.
 
@@ -1110,6 +1115,10 @@ async def download_file_with_progress(
         last_update = 0.0
         with local_source.open("rb") as source, destination.open("wb") as output:
             while chunk := source.read(1024 * 1024):
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise UploadCancelled
+                if received + len(chunk) > settings.upload_max_bytes:
+                    raise ValueError("Telegram file exceeds the configured upload limit.")
                 output.write(chunk)
                 received += len(chunk)
                 now = time.monotonic()
@@ -1117,6 +1126,8 @@ async def download_file_with_progress(
                     await update_progress(received)
                     last_update = now
         await update_progress(received, complete=True)
+        if expected_bytes is not None and received != expected_bytes:
+            raise ValueError("Telegram file download was incomplete.")
         return
     url = telegram_file_download_url(settings, file_path)
     last_update = 0.0
@@ -1127,6 +1138,10 @@ async def download_file_with_progress(
             response.raise_for_status()
             with destination.open("wb") as output:
                 async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise UploadCancelled
+                    if received + len(chunk) > settings.upload_max_bytes:
+                        raise ValueError("Telegram file exceeds the configured upload limit.")
                     output.write(chunk)
                     received += len(chunk)
                     now = time.monotonic()
@@ -1134,6 +1149,8 @@ async def download_file_with_progress(
                         await update_progress(received)
                         last_update = now
     await update_progress(received, complete=True)
+    if expected_bytes is not None and received != expected_bytes:
+        raise ValueError("Telegram file download was incomplete.")
 
 
 async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1362,6 +1379,7 @@ async def _download_telegram_document(
     settings: Settings,
     document,
     filename: str,
+    cancellation_event: Event,
 ) -> None:
     message = update.effective_message
     settings.data_directory.mkdir(parents=True, exist_ok=True)
@@ -1386,10 +1404,15 @@ async def _download_telegram_document(
         await download_file_with_progress(
             settings, telegram_file.file_path, temporary_path, context.bot,
             status_message.chat_id, status_message.message_id, filename, document.file_size,
+            cancellation_event,
         )
         actual_size = temporary_path.stat().st_size
         if actual_size > settings.upload_max_bytes:
             temporary_path.unlink(missing_ok=True)
+            context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+            events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+            if events.get(update.effective_user.id) is cancellation_event:
+                events.pop(update.effective_user.id, None)
             await status_message.edit_text(
                 f"❌ حجم فایل ({actual_size:,} بایت) از سقف تنظیم‌شده ({settings.upload_max_bytes:,} بایت) بیشتر است؛ فایل حذف شد."
             )
@@ -1399,6 +1422,18 @@ async def _download_telegram_document(
             "operation=telegram_upload stage=download_complete filename=%s bytes=%d path=%s",
             filename, actual_size, final_path,
         )
+    except UploadCancelled:
+        temporary_path.unlink(missing_ok=True)
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+        if events.get(update.effective_user.id) is cancellation_event:
+            events.pop(update.effective_user.id, None)
+        await status_message.edit_text(progress_text(
+            "⚪ دریافت فایل لغو شد",
+            "درخواست با /start لغو شد؛ فایل موقت پاک شد و ورود اطلاعات شروع نشد",
+            100,
+        ))
+        return
     except Exception as exc:
         detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
         _log_exception_redacted(
@@ -1409,6 +1444,10 @@ async def _download_telegram_document(
             document.file_id,
         )
         temporary_path.unlink(missing_ok=True)
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+        events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+        if events.get(update.effective_user.id) is cancellation_event:
+            events.pop(update.effective_user.id, None)
         await status_message.edit_text(progress_text(
             "❌ دریافت فایل ناموفق بود",
             "مرحلهٔ دریافت از Telegram",
@@ -1427,6 +1466,10 @@ async def _download_telegram_document(
         status_message_id=status_message.message_id,
     )
     await show_upload_header_selection(context, settings, job, status_message)
+    context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+    events: dict[int, Event] = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
+    if events.get(update.effective_user.id) is cancellation_event:
+        events.pop(update.effective_user.id, None)
 
 
 async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1455,14 +1498,21 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
         return
     context.user_data[UPLOAD_TRANSFER_KEY] = "telegram"
-    try:
-        LOGGER.info(
-            "operation=telegram_upload stage=accepted user_id=%s filename=%s expected_bytes=%s",
-            update.effective_user.id, filename, document.file_size,
-        )
-        await _download_telegram_document(update, context, settings, document, filename)
-    finally:
-        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
+    cancellation_event = Event()
+    context.application.bot_data.setdefault(UPLOAD_CANCELLATIONS_KEY, {})[
+        update.effective_user.id
+    ] = cancellation_event
+    LOGGER.info(
+        "operation=telegram_upload stage=accepted user_id=%s filename=%s expected_bytes=%s",
+        update.effective_user.id, filename, document.file_size,
+    )
+    context.application.create_task(
+        _download_telegram_document(
+            update, context, settings, document, filename, cancellation_event
+        ),
+        update=update,
+        name="telegram-csv-download",
+    )
 def _drive_progress_text(
     filename: str,
     received: int,
@@ -2071,7 +2121,7 @@ def _database_file_view(
     return text, keyboard
 
 
-def _archive_and_delete_database_file(
+def _archive_and_delete_database_file_unlocked(
     settings: Settings,
     file_id: int,
     progress_callback: Callable[[str, float], None] | None = None,
@@ -2135,6 +2185,18 @@ def _archive_and_delete_database_file(
         return result, archived_path
     finally:
         connection.close()
+
+
+def _archive_and_delete_database_file(
+    settings: Settings,
+    file_id: int,
+    progress_callback: Callable[[str, float], None] | None = None,
+):
+    """Move a source and remove its index without racing search/import work."""
+    with DATABASE_OPERATION_LOCK:
+        return _archive_and_delete_database_file_unlocked(
+            settings, file_id, progress_callback
+        )
 
 
 async def database_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
