@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 from typing import FrozenSet
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -94,6 +95,10 @@ class Settings:
     admin_user_ids: FrozenSet[int] = frozenset()
     initial_access_mode: str = "private"
     primary_admin_user_ids: FrozenSet[int] = frozenset()
+    search_audit_enabled: bool = True
+    search_audit_store_query: bool = True
+    search_audit_retention_days: int = 0
+    bot_timezone: str = "Asia/Tehran"
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(PROJECT_ROOT / ".env", override=False)
@@ -161,6 +166,10 @@ class Settings:
             admin_user_ids=admin_user_ids,
             initial_access_mode=os.getenv("ACCESS_MODE", "private").strip().lower(),
             primary_admin_user_ids=primary_admin_user_ids,
+            search_audit_enabled=_env_bool("SEARCH_AUDIT_ENABLED", True),
+            search_audit_store_query=_env_bool("SEARCH_AUDIT_STORE_QUERY", True),
+            search_audit_retention_days=_env_int("SEARCH_AUDIT_RETENTION_DAYS", 0, minimum=0),
+            bot_timezone=os.getenv("BOT_TIMEZONE", "Asia/Tehran").strip() or "Asia/Tehran",
         )
         if settings.results_per_page > settings.max_results:
             raise ConfigurationError("RESULTS_PER_PAGE cannot exceed MAX_RESULTS.")
@@ -180,6 +189,10 @@ class Settings:
             raise ConfigurationError("Telegram API base URLs cannot be empty.")
         if settings.initial_access_mode not in {"private", "public"}:
             raise ConfigurationError("ACCESS_MODE must be private or public.")
+        try:
+            ZoneInfo(settings.bot_timezone)
+        except Exception as exc:
+            raise ConfigurationError("BOT_TIMEZONE must be a valid IANA timezone.") from exc
         return settings
 
     def validate_for_bot(self) -> None:

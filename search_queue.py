@@ -6,8 +6,11 @@ from collections import deque
 from dataclasses import dataclass, field
 import logging
 from threading import Event
+import time
+import uuid
 from typing import Any, Awaitable, Callable
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from progress_utils import progress_text
 
 LOGGER = logging.getLogger("telegram_csv_search")
@@ -15,12 +18,15 @@ LOGGER = logging.getLogger("telegram_csv_search")
 
 @dataclass(slots=True)
 class SearchRequest:
+    request_id: str
     update: Any
     context: Any
     query: str
     user_id: int
     status_message: Any
     cancel_event: Event = field(default_factory=Event)
+    enqueued_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
 
 
 SearchProcessor = Callable[..., Awaitable[None]]
@@ -36,6 +42,7 @@ class SearchQueue:
         self._active: SearchRequest | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._durations: deque[float] = deque(maxlen=50)
 
     def is_user_busy(self, user_id: int | None) -> bool:
         if user_id is None:
@@ -89,15 +96,22 @@ class SearchQueue:
             return False
 
         position = len(self._queue) + (1 if self._active else 0) + 1
+        request_id = uuid.uuid4().hex[:16]
         if self.is_busy:
             status_message = await message.reply_text(
-                f"⏳ درخواست جست‌وجوی شما در صف انتظار قرار گرفت\nجایگاه فعلی: {position}"
+                f"⏳ درخواست جست‌وجوی شما در صف انتظار قرار گرفت\nجایگاه فعلی: {position}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "❌ لغو جست‌وجو", callback_data=f"q:cancel:{request_id}"
+                )]]),
             )
         else:
             status_message = await message.reply_text(
-                progress_text("🔎 جست‌وجو", "در حال آماده‌سازی برای شروع", 0)
+                progress_text("🔎 جست‌وجو", "در حال آماده‌سازی برای شروع", 0),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "❌ لغو جست‌وجو", callback_data=f"q:cancel:{request_id}"
+                )]]),
             )
-        request = SearchRequest(update, context, query, user_id, status_message)
+        request = SearchRequest(request_id, update, context, query, user_id, status_message)
         self._queue.append(request)
         self._pending_by_user[user_id] = request
         LOGGER.info(
@@ -121,6 +135,7 @@ class SearchQueue:
                 if request.cancel_event.is_set():
                     continue
                 self._active = request
+                request.started_at = time.monotonic()
                 LOGGER.info(
                     "operation=search_queue stage=started user_id=%s waiting=%d",
                     request.user_id, len(self._queue),
@@ -145,6 +160,8 @@ class SearchQueue:
                     except Exception:
                         LOGGER.exception("operation=search_queue stage=error_message_failed user_id=%s", request.user_id)
                 finally:
+                    if request.started_at is not None:
+                        self._durations.append(time.monotonic() - request.started_at)
                     self._active = None
                     LOGGER.info("operation=search_queue stage=completed user_id=%s", request.user_id)
         finally:
@@ -189,6 +206,27 @@ class SearchQueue:
             user_id, cancelled_waiting, active_cancel_requested,
         )
         return cancelled_waiting, active_cancel_requested
+
+    def cancel_request(self, request_id: str, user_id: int) -> str:
+        for request in list(self._queue):
+            if request.request_id == request_id:
+                if request.user_id != user_id:
+                    return "unauthorized"
+                self._queue.remove(request)
+                self._pending_by_user.pop(user_id, None)
+                request.cancel_event.set()
+                return "queued"
+        if self._active and self._active.request_id == request_id:
+            if self._active.user_id != user_id:
+                return "unauthorized"
+            self._active.cancel_event.set()
+            return "active"
+        return "missing"
+
+    def estimated_wait_seconds(self, request: SearchRequest) -> int:
+        average = sum(self._durations) / len(self._durations) if self._durations else 0
+        ahead = list(self._queue).index(request) if request in self._queue else 0
+        return int(max(0, average * (ahead + (1 if self._active else 0))))
 
     async def stop(self) -> None:
         self._stopping = True

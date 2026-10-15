@@ -13,7 +13,7 @@ from typing import Callable, Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 LOGGER = logging.getLogger("telegram_csv_search")
 SQLITE_WRITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = 120_000
@@ -104,10 +104,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
             "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
         )
-    if stored_version not in {None, "2", "3", "4", "5", SCHEMA_VERSION}:
+    if stored_version not in {None, "2", "3", "4", "5", "6", SCHEMA_VERSION}:
         raise DatabaseRebuildRequired(
             f"Unsupported SQLite schema version {stored_version!r}; expected "
-            f"2, 3, 4, 5 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+            f"2, 3, 4, 5, 6 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
         )
     connection.executescript(
         """
@@ -186,6 +186,26 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             source_header TEXT NOT NULL,
             updated_at TEXT NOT NULL
         ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS search_activity (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            telegram_user_id INTEGER NOT NULL,
+            first_name TEXT NOT NULL DEFAULT '',
+            last_name TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT '',
+            dataset_name TEXT NOT NULL DEFAULT 'همهٔ دیتاست‌ها',
+            query_text TEXT,
+            status TEXT NOT NULL,
+            result_count INTEGER,
+            duration_ms INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_activity_started ON search_activity(started_at);
+        CREATE INDEX IF NOT EXISTS idx_search_activity_user ON search_activity(telegram_user_id);
+        CREATE INDEX IF NOT EXISTS idx_search_activity_status ON search_activity(status);
 
         CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file_id);
 

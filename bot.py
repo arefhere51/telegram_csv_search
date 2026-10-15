@@ -92,6 +92,7 @@ from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
 from import_csv import read_csv_header
 from search_queue import SearchQueue
+from search_audit import dashboard_metrics, export_report, finish_event, start_event
 
 LOGGER = logging.getLogger("telegram_csv_search")
 SESSION_KEY = "search_sessions"
@@ -101,6 +102,7 @@ SEARCH_QUEUE_KEY = "search_queue"
 UPLOAD_CANCELLATIONS_KEY = "upload_cancellation_events"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
+GUIDED_SEARCH_KEY = "guided_search"
 SEARCH_PREVIEW_LIMIT = 5
 SEARCH_EXPORT_MAX_RECORDS = 2000
 SEARCH_EXPORT_PAGE_SIZE = 1000
@@ -703,6 +705,7 @@ async def respond_to_search(
         0,
     ))
     started = time.perf_counter()
+    audit_event_id = start_event(settings, update, query)
     try:
         check_search_cancellation(cancellation_event)
         await status.edit_text(progress_text(
@@ -746,6 +749,7 @@ async def respond_to_search(
                 100,
                 detail=f"عبارت جست‌وجو: {escape(query)}\nلطفاً عبارت دیگری را امتحان کنید.",
             ))
+            finish_event(settings, audit_event_id, "no_results", 0, started)
             return
 
         mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(
@@ -776,6 +780,7 @@ async def respond_to_search(
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
+                finish_event(settings, audit_event_id, "success", result.total_count, started)
                 return
             preview_requires_txt = True
             LOGGER.info(
@@ -945,7 +950,11 @@ async def respond_to_search(
                 detail,
                 100,
             ))
+            finish_event(settings, audit_event_id, "failed", result.total_count, started)
+        else:
+            finish_event(settings, audit_event_id, "success", result.total_count, started)
     except SearchCancelled:
+        finish_event(settings, audit_event_id, "cancelled", None, started)
         LOGGER.info("operation=search stage=cancelled_by_start user_id=%s", update.effective_user.id)
         try:
             await status.edit_text(progress_text(
@@ -956,6 +965,7 @@ async def respond_to_search(
         except Exception:
             LOGGER.exception("operation=search stage=cancel_status_update_failed user_id=%s", update.effective_user.id)
     except Exception as exc:
+        finish_event(settings, audit_event_id, "failed", None, started)
         _log_exception_redacted(
             "operation=search stage=search_failed user_id=%s query_length=%d error_type=%s"
             % (update.effective_user.id, len(query), type(exc).__name__),
@@ -1036,7 +1046,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if is_admin(user_id, settings):
         lines.append("برای دیدن پنل مدیریت و دسته‌بندی ابزارها از /admin استفاده کنید.")
     lines.extend(["", cancellation_note])
-    await update.effective_message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 شروع جست‌وجو", callback_data="g:start")],
+            [InlineKeyboardButton("📖 راهنما", callback_data="g:help")],
+            [InlineKeyboardButton("❌ لغو عملیات", callback_data="g:cancel")],
+        ]),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1055,6 +1072,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if is_admin(update.effective_user.id, settings):
         lines.append("برای دیدن راهنمای کامل مدیریت و دستورات مدیریتی، /admin را بفرستید.")
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def guided_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    callback = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if callback is None or await deny_if_unauthorized(update, settings):
+        return
+    action = (callback.data or "").split(":")[-1]
+    await callback.answer()
+    if action == "start":
+        context.user_data[GUIDED_SEARCH_KEY] = True
+        await callback.message.reply_text(
+            "🔍 عبارت جست‌وجو را بفرستید.\nمثال: علی یا 0912\nبرای لغو، /start را بفرستید."
+        )
+    elif action == "help":
+        await help_command(update, context)
+    elif action == "cancel":
+        context.user_data.pop(GUIDED_SEARCH_KEY, None)
+        await callback.message.reply_text("عملیات راهنما لغو شد.")
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1217,6 +1253,7 @@ async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
+    context.user_data.pop(GUIDED_SEARCH_KEY, None)
     queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
     await queue.submit(update, context, update.effective_message.text or "")
 
@@ -1865,6 +1902,11 @@ def _admin_keyboard(settings: Settings, *, primary_admin: bool = False) -> Inlin
             InlineKeyboardButton("📥 فایل‌ها و دریافت", callback_data="adm:section:uploads"),
             InlineKeyboardButton(mode_label, callback_data=f"adm:mode:{'public' if mode == 'private' else 'private'}"),
         ],
+        [
+            InlineKeyboardButton("🧾 فعالیت جست‌وجو", callback_data="adm:section:audit"),
+            InlineKeyboardButton("📤 گزارش TXT", callback_data="adm:export:menu"),
+        ],
+        [InlineKeyboardButton("⏳ صف جست‌وجوها", callback_data="adm:section:queue")],
     ]
     if primary_admin:
         rows.insert(2, [InlineKeyboardButton("🛡 مدیران ربات", callback_data="adm:section:admins")])
@@ -1904,6 +1946,24 @@ def _admin_panel_text(settings: Settings, *, primary_admin: bool = False) -> str
     )
 
 
+def _audit_dashboard_text(settings: Settings) -> str:
+    metrics = dashboard_metrics(settings)
+    mode = "عمومی" if metrics["mode"] == "public" else "خصوصی"
+    return (
+        f"🔐 دسترسی: {mode}\n"
+        f"🔎 جست‌وجوی امروز: {metrics['total']}\n"
+        f"✅ تکمیل‌شده: {metrics['completed']}\n"
+        f"📭 بدون نتیجه: {metrics['no_results']}\n"
+        f"⚠️ ناموفق: {metrics['failed']}\n"
+        f"⚪ لغوشده: {metrics['cancelled']}\n"
+        f"👥 کاربران جست‌وجوکننده امروز: {metrics['users_today']}\n"
+        f"📅 کاربران هفت روز اخیر: {metrics['users_week']}\n"
+        f"👤 کاربران مجاز: {metrics['users']}\n"
+        f"🗂 دیتاست‌های آماده: {metrics['datasets']}\n"
+        f"📄 رکوردهای ایندکس‌شده: {metrics['records']}"
+    )
+
+
 def _admin_section_view(
     settings: Settings, section: str, *, primary_admin: bool = False
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -1911,7 +1971,11 @@ def _admin_section_view(
     mode_text = "عمومی" if mode == "public" else "خصوصی"
     sections = {
         "status": (
-            "آمار و وضعیت\nبرای مشاهدهٔ تعداد رکوردها، حجم دیتابیس و تعداد فایل‌های ایندکس‌شده از /stats استفاده کنید."
+            "آمار و وضعیت\n" + _audit_dashboard_text(settings)
+        ),
+        "audit": (
+            "🧾 فعالیت جست‌وجو\n" + _audit_dashboard_text(settings)
+            + "\n\nبرای دریافت تاریخچهٔ کامل از دکمهٔ گزارش TXT در پنل استفاده کنید."
         ),
         "data": (
             "فایل‌ها و دیتابیس\nاز /database برای دیدن فایل‌های ایندکس‌شده، جزئیات هر فایل و حذف امن یک دیتاست با تأیید استفاده کنید."
@@ -2483,8 +2547,62 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if action == "section":
         await callback.answer()
-        text, keyboard = _admin_section_view(settings, value, primary_admin=primary_admin)
+        if value == "queue":
+            queue = context.application.bot_data.get(SEARCH_QUEUE_KEY)
+            active = queue._active if queue is not None else None
+            waiting = list(queue._queue) if queue is not None else []
+            text = (
+                "⏳ صف جست‌وجوها\n"
+                f"در حال اجرا: {'بله' if active else 'خیر'}\n"
+                f"درخواست‌های منتظر: {len(waiting)}\n"
+                + (f"درخواست فعال: کاربر {active.user_id}\n" if active else "")
+                + ("\n".join(f"#{i} — کاربر {item.user_id} — {item.query[:40]}" for i, item in enumerate(waiting, 1))
+                   if waiting else "صف در حال حاضر خالی است.")
+            )
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:section:queue")], [InlineKeyboardButton("↩️ بازگشت", callback_data="adm:home:0")]])
+        else:
+            text, keyboard = _admin_section_view(settings, value, primary_admin=primary_admin)
         await callback.edit_message_text(text, reply_markup=keyboard)
+        return
+    if action == "export":
+        if not primary_admin:
+            await callback.answer("گزارش فعالیت فقط برای مدیر اصلی مجاز است.", show_alert=True)
+            return
+        if value == "menu":
+            await callback.answer()
+            await callback.edit_message_text(
+                "📤 بازهٔ گزارش فعالیت جست‌وجو را انتخاب کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("امروز", callback_data="adm:export:today")],
+                    [InlineKeyboardButton("۷ روز اخیر", callback_data="adm:export:7d")],
+                    [InlineKeyboardButton("همهٔ تاریخچه", callback_data="adm:export:all")],
+                    [InlineKeyboardButton("↩️ بازگشت", callback_data="adm:home:0")],
+                ]),
+            )
+            return
+        if value not in {"today", "7d", "all"}:
+            await callback.answer("بازهٔ گزارش نامعتبر است.", show_alert=True)
+            return
+        await callback.answer("در حال ساخت گزارش...")
+        temp_fd, temp_name = tempfile.mkstemp(prefix="search-activity-", suffix=".txt")
+        os.close(temp_fd)
+        temp_path = Path(temp_name)
+        try:
+            has_rows = await asyncio.to_thread(export_report, settings, temp_path, value)
+            if not has_rows:
+                await callback.message.reply_text("برای این بازه فعالیت جست‌وجویی ثبت نشده است.")
+            else:
+                with temp_path.open("rb") as report_file:
+                    await callback.message.reply_document(
+                        document=report_file,
+                        filename=f"search_activity_{value}.txt",
+                        caption="گزارش فعالیت جست‌وجو؛ UTF-8",
+                    )
+        except Exception as exc:
+            _log_exception_redacted("operation=admin stage=search_report_failed", exc, settings.telegram_bot_token)
+            await callback.message.reply_text("ساخت یا ارسال گزارش ناموفق بود؛ جزئیات در لاگ ثبت شد.")
+        finally:
+            temp_path.unlink(missing_ok=True)
         return
     if action == "mode" and value in {"private", "public"}:
         connection = connect(settings.database_path)
@@ -2785,6 +2903,29 @@ async def log_update_completed(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def queue_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    callback = update.callback_query
+    settings: Settings = context.application.bot_data["settings"]
+    if callback is None or await deny_if_unauthorized(update, settings):
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "q" or parts[1] != "cancel":
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
+    result = queue.cancel_request(parts[2], int(update.effective_user.id))
+    if result == "queued":
+        await callback.answer("جست‌وجو از صف حذف شد.")
+        await callback.edit_message_text("⚪ جست‌وجو لغو شد\nدرخواست پیش از شروع پردازش از صف حذف شد.")
+    elif result == "active":
+        await callback.answer("درخواست لغو شد؛ توقف ایمن در حال انجام است.")
+        await callback.edit_message_text("⏳ درخواست لغو دریافت شد\nدر حال متوقف‌کردن ایمن عملیات جاری...")
+    elif result == "unauthorized":
+        await callback.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+    else:
+        await callback.answer("این درخواست دیگر در صف نیست.", show_alert=True)
+
+
 async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     callback = update.callback_query
@@ -2967,8 +3108,10 @@ def main() -> None:
     application.add_handler(CommandHandler("header_hidden", hidden_headers_command))
     application.add_handler(CommandHandler("drive_setup", drive_setup_command))
     application.add_handler(CallbackQueryHandler(database_management_callback, pattern=r"^db:"))
+    application.add_handler(CallbackQueryHandler(guided_search_callback, pattern=r"^g:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
+    application.add_handler(CallbackQueryHandler(queue_cancel_callback, pattern=r"^q:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_upload))
     application.add_handler(MessageHandler(
