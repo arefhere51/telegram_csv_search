@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import sqlite3
 import tempfile
 from threading import Event
 import time
@@ -24,7 +25,14 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChatMember,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import TimedOut
 from telegram.ext import (
@@ -50,7 +58,9 @@ from google_drive import (
 )
 from database import (
     access_mode as db_access_mode,
+    add_bot_admin,
     add_bot_user,
+    bot_admin_exists,
     bot_user_exists,
     connect,
     count_completed_files,
@@ -66,9 +76,11 @@ from database import (
     initialize_database,
     list_completed_files,
     list_bot_users,
+    list_bot_admins,
     list_header_alias_entries,
     list_hidden_headers,
     remove_bot_user,
+    remove_bot_admin,
     set_access_mode,
     set_header_alias,
     show_header,
@@ -156,8 +168,31 @@ class UploadSelectionSession:
     page: int = 0
 
 
+def is_primary_admin(user_id: int | None, settings: Settings) -> bool:
+    if user_id is None:
+        return False
+    primary_ids = settings.primary_admin_user_ids
+    if primary_ids:
+        return user_id in primary_ids
+    # Compatibility for Settings objects created by older deployments/tests.
+    return bool(settings.admin_user_ids) and user_id == min(settings.admin_user_ids)
+
+
 def is_admin(user_id: int | None, settings: Settings) -> bool:
-    return user_id is not None and user_id in settings.admin_user_ids
+    if user_id is None:
+        return False
+    if user_id in settings.admin_user_ids or is_primary_admin(user_id, settings):
+        return True
+    try:
+        connection = connect(settings.database_path, readonly=True)
+        try:
+            return bot_admin_exists(connection, user_id)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        # Fail closed if the role database is unavailable.
+        LOGGER.exception("Could not verify dynamic administrator user_id=%s", user_id)
+        return False
 
 
 def access_state(settings: Settings) -> tuple[str, list[int]]:
@@ -886,11 +921,33 @@ async def respond_to_search(
         ))
 
 
+async def process_queued_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    *,
+    status_message,
+    cancellation_event: Event,
+) -> None:
+    """Adapt SearchQueue's request signature to the search handler's settings argument."""
+    settings: Settings = context.application.bot_data["settings"]
+    await respond_to_search(
+        update,
+        context,
+        settings,
+        query,
+        status_message=status_message,
+        cancellation_event=cancellation_event,
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
     user_id = update.effective_user.id
+    if is_admin(user_id, settings):
+        await _sync_user_command_scope(context.bot, user_id, settings)
     queue: SearchQueue | None = context.application.bot_data.get(SEARCH_QUEUE_KEY)
     cancelled_waiting, active_cancel_requested = (0, False)
     if queue is not None:
@@ -916,13 +973,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         cancellation_note += "\nانتخاب ستون فایل ناتمام لغو شد و فایل موقت آن پاک شد."
     if not cancellation_note:
         cancellation_note = "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت."
-    await update.effective_message.reply_text(
-        "یک عبارت بفرستید تا در ستون‌های قابل جست‌وجوی فایل‌های CSV جست‌وجو شود. "
-        "اگر حداکثر ۵ نتیجه پیدا شود، همه در پیام نشان داده می‌شوند؛ اگر بیش از ۵ نتیجه باشد، فقط فایل متنی فرستاده می‌شود.\n\n"
-        "برای دریافت فایل از Drive، لینک اشتراک‌گذاری CSV را بفرستید؛ مدیر برای دیدن ایمیل دسترسی ربات /drive_setup را اجرا کند.\n"
-        "دستورها: /search <عبارت>، /stats، /admin، /database\n\n"
-        f"{cancellation_note}"
-    )
+    lines = [
+        "سلام. عبارت موردنظرتان را همین‌جا بفرستید یا از /search <عبارت> استفاده کنید.",
+        "ربات در ستون‌هایی می‌گردد که هنگام افزودن فایل برای جست‌وجو انتخاب شده‌اند، اما نتیجه، اطلاعات کامل همان ردیف را نشان می‌دهد.",
+        "تا ۵ نتیجه در پیام نمایش داده می‌شود؛ اگر بیشتر باشد، فایل TXT فرستاده می‌شود. خروجی TXT حداکثر ۲۰۰۰ ردیف دارد؛ برای نتیجه‌های بیشتر عبارت را دقیق‌تر کنید.",
+        "برای دیدن آمار از /stats استفاده کنید. اگر پردازشی برایتان در حال انجام است، /start درخواست‌های جست‌وجوی شما را لغو می‌کند.",
+    ]
+    if upload_authorized(update, settings):
+        lines.append(
+            "برای افزودن داده، فایل CSV/TXT را در گفت‌وگوی خصوصی بفرستید یا لینک اشتراک‌گذاری فایل CSV/TXT در Google Drive را ارسال کنید."
+        )
+    else:
+        lines.append("ارسال فایل برای مدیران و کاربران ثبت‌شده فعال است.")
+    if is_admin(user_id, settings):
+        lines.append("برای دیدن پنل مدیریت و دسته‌بندی ابزارها از /admin استفاده کنید.")
+    lines.extend(["", cancellation_note])
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1671,13 +1737,32 @@ async def drive_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-def _admin_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+def _admin_keyboard(settings: Settings, *, primary_admin: bool = False) -> InlineKeyboardMarkup:
     mode, users = access_state(settings)
     mode_label = "🔓 عمومی‌کردن ربات" if mode == "private" else "🔒 خصوصی‌کردن ربات"
-    rows: list[list[InlineKeyboardButton]] = [[
-        InlineKeyboardButton(mode_label, callback_data=f"adm:mode:{'public' if mode == 'private' else 'private'}")
-    ]]
-    removable = [user_id for user_id in users if user_id not in settings.admin_user_ids]
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("📊 آمار و وضعیت", callback_data="adm:section:status"),
+            InlineKeyboardButton("🗄 فایل‌ها و دیتابیس", callback_data="adm:section:data"),
+        ],
+        [
+            InlineKeyboardButton("👥 کاربران و دسترسی", callback_data="adm:section:users"),
+            InlineKeyboardButton("🏷 هدرهای خروجی", callback_data="adm:section:headers"),
+        ],
+        [
+            InlineKeyboardButton("📥 فایل‌ها و دریافت", callback_data="adm:section:uploads"),
+            InlineKeyboardButton(mode_label, callback_data=f"adm:mode:{'public' if mode == 'private' else 'private'}"),
+        ],
+    ]
+    if primary_admin:
+        rows.insert(2, [InlineKeyboardButton("🛡 مدیران ربات", callback_data="adm:section:admins")])
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        dynamic_admins = set(list_bot_admins(connection))
+    finally:
+        connection.close()
+    protected_admins = set(settings.admin_user_ids) | dynamic_admins
+    removable = [user_id for user_id in users if user_id not in protected_admins]
     for start in range(0, min(len(removable), 40), 2):
         rows.append([
             InlineKeyboardButton(f"حذف {user_id}", callback_data=f"adm:remove:{user_id}")
@@ -1686,27 +1771,87 @@ def _admin_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _admin_panel_text(settings: Settings) -> str:
+def _admin_panel_text(settings: Settings, *, primary_admin: bool = False) -> str:
     mode, users = access_state(settings)
     mode_text = "عمومی؛ جست‌وجو برای همه باز است" if mode == "public" else "خصوصی؛ فقط کاربران مجاز"
-    removable_count = sum(user_id not in settings.admin_user_ids for user_id in users)
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        dynamic_admins = set(list_bot_admins(connection))
+    finally:
+        connection.close()
+    protected_admins = set(settings.admin_user_ids) | dynamic_admins
+    removable_count = sum(user_id not in protected_admins for user_id in users)
+    role_note = "مدیر اصلی" if primary_admin else "مدیر"
     return (
-        "پنل مدیریت\n"
+        f"پنل مدیریت — {role_note}\n"
         f"وضعیت دسترسی: {mode_text}\n"
         f"کاربران ثبت‌شده: {len(users)} (قابل حذف از دکمه‌ها: {min(removable_count, 40)})\n\n"
-        "افزودن کاربر: /user_add 123456789\n"
-        "حذف کاربر: /user_remove 123456789\n"
-        "تغییر حالت: /access private یا /access public\n"
-        "مدیریت فایل‌ها و حذف ایندکس: /database\n"
-        "تغییر نام هدر سراسری: /header_set NATIONAL_CODE = کد ملی\n"
-        "دیدن نام‌های هدر: /header_aliases\n"
-        "بازگرداندن نام اصلی هدر: /header_remove NATIONAL_CODE\n"
-        "مخفی‌کردن هدر در پیام و TXT: /header_hide NATIONAL_CODE\n"
-        "نمایش دوبارهٔ هدر: /header_show NATIONAL_CODE\n"
-        "دیدن فهرست هدرهای مخفی: /header_hidden\n"
-        "آماده‌سازی دریافت از Google Drive: /drive_setup\n\n"
+        "برای راهنمای هر دسته، یکی از دکمه‌های شیشه‌ای را انتخاب کنید.\n"
+        "مدیران فعلی دسترسی خود را حفظ می‌کنند؛ فقط مدیر اصلی می‌تواند نقش مدیران را تغییر دهد.\n"
         "حالت عمومی فقط جست‌وجو را برای همه باز می‌کند؛ بارگذاری فایل همچنان فقط برای کاربران مجاز است."
     )
+
+
+def _admin_section_view(
+    settings: Settings, section: str, *, primary_admin: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    mode, users = access_state(settings)
+    mode_text = "عمومی" if mode == "public" else "خصوصی"
+    sections = {
+        "status": (
+            "آمار و وضعیت\nبرای مشاهدهٔ تعداد رکوردها، حجم دیتابیس و تعداد فایل‌های ایندکس‌شده از /stats استفاده کنید."
+        ),
+        "data": (
+            "فایل‌ها و دیتابیس\nاز /database برای دیدن فایل‌های ایندکس‌شده، جزئیات هر فایل و حذف امن یک دیتاست با تأیید استفاده کنید."
+        ),
+        "users": (
+            "کاربران و دسترسی\n"
+            "افزودن کاربر: /user_add 123456789\n"
+            "حذف کاربر: /user_remove 123456789\n"
+            "تغییر حالت دسترسی: /access private یا /access public\n"
+            f"حالت فعلی: {mode_text}؛ کاربران ثبت‌شده: {len(users)}."
+        ),
+        "headers": (
+            "هدرهای خروجی\n"
+            "تغییر نام: /header_set NATIONAL_CODE = کد ملی\n"
+            "فهرست نام‌ها: /header_aliases\n"
+            "بازگشت به نام اصلی: /header_remove NATIONAL_CODE\n"
+            "مخفی‌کردن: /header_hide NATIONAL_CODE\n"
+            "نمایش دوباره: /header_show NATIONAL_CODE\n"
+            "فهرست هدرهای مخفی: /header_hidden"
+        ),
+        "uploads": (
+            "بارگذاری و دریافت فایل\n"
+            "فایل CSV/TXT را در گفت‌وگوی خصوصی بفرستید یا لینک اشتراک‌گذاری فایل CSV/TXT در Google Drive را ارسال کنید.\n"
+            "برای راهنمای اشتراک‌گذاری Drive از /drive_setup استفاده کنید."
+        ),
+    }
+    if section == "admins":
+        if not primary_admin:
+            return "این بخش فقط برای مدیر اصلی قابل مشاهده است.", InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 بازگشت به پنل مدیریت", callback_data="adm:home:0")]]
+            )
+        connection = connect(settings.database_path, readonly=True)
+        try:
+            dynamic_admins = list_bot_admins(connection)
+        finally:
+            connection.close()
+        all_admins = sorted(set(settings.admin_user_ids) | set(dynamic_admins))
+        admin_lines = "\n".join(f"• {user_id}" for user_id in all_admins) or "• هنوز مدیری ثبت نشده است"
+        text = (
+            "مدیران ربات\n"
+            f"مدیر اصلی: {', '.join(map(str, sorted(settings.primary_admin_user_ids))) or 'اولین مدیر پیکربندی‌شده'}\n"
+            f"مدیران فعلی:\n{admin_lines}\n\n"
+            "افزودن مدیر: /admin_add 123456789\n"
+            "حذف نقش مدیر: /admin_remove 123456789\n"
+            "مدیران تعریف‌شده در فایل .env فقط با تغییر همان فایل قابل حذف‌اند."
+        )
+    else:
+        text = sections.get(section, "این بخش شناخته نشد.")
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 بازگشت به پنل مدیریت", callback_data="adm:home:0")]]
+    )
+    return text, keyboard
 
 
 async def _deny_non_admin(update: Update, settings: Settings) -> bool:
@@ -1719,6 +1864,131 @@ async def _deny_non_admin(update: Update, settings: Settings) -> bool:
             await update.effective_message.reply_text("فرمان‌های مدیریت را فقط در گفت‌وگوی خصوصی با ربات اجرا کنید.")
         return True
     return False
+
+
+async def _deny_non_primary_admin(update: Update, settings: Settings) -> bool:
+    if await _deny_non_admin(update, settings):
+        return True
+    if not is_primary_admin(update.effective_user.id, settings):
+        if update.effective_message:
+            await update.effective_message.reply_text("تغییر نقش مدیران فقط در اختیار مدیر اصلی ربات است.")
+        return True
+    return False
+
+
+def _user_bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand("start", "راهنمای استفاده و لغو درخواست جاری"),
+        BotCommand("search", "جست‌وجو با عبارت دلخواه"),
+        BotCommand("stats", "آمار پایگاه‌داده"),
+    ]
+
+
+def _admin_bot_commands(*, primary_admin: bool) -> list[BotCommand]:
+    commands = _user_bot_commands() + [
+        BotCommand("admin", "پنل مدیریت دسته‌بندی‌شده"),
+        BotCommand("database", "مدیریت فایل‌های ایندکس‌شده"),
+        BotCommand("user_add", "افزودن کاربر مجاز"),
+        BotCommand("user_remove", "قطع دسترسی یک کاربر"),
+        BotCommand("access", "تغییر حالت خصوصی/عمومی"),
+        BotCommand("header_set", "تغییر نام نمایشی هدر"),
+        BotCommand("header_hide", "مخفی‌کردن هدر در خروجی"),
+        BotCommand("header_show", "نمایش دوبارهٔ هدر"),
+        BotCommand("header_aliases", "فهرست نام‌های نمایشی هدر"),
+        BotCommand("header_hidden", "فهرست هدرهای مخفی"),
+        BotCommand("header_remove", "بازگرداندن نام اصلی هدر"),
+        BotCommand("drive_setup", "راهنمای دریافت فایل از Drive"),
+    ]
+    if primary_admin:
+        commands.extend([
+            BotCommand("admin_add", "افزودن مدیر جدید"),
+            BotCommand("admin_remove", "حذف نقش مدیر"),
+        ])
+    return commands
+
+
+async def _sync_user_command_scope(bot, user_id: int, settings: Settings, *, remove_admin: bool = False) -> None:
+    scope = BotCommandScopeChatMember(chat_id=int(user_id), user_id=int(user_id))
+    try:
+        if remove_admin:
+            await bot.delete_my_commands(scope=scope)
+        else:
+            await bot.set_my_commands(
+                _admin_bot_commands(primary_admin=is_primary_admin(user_id, settings)),
+                scope=scope,
+            )
+    except Exception:
+        LOGGER.exception("Could not synchronize Telegram command menu user_id=%s", user_id)
+
+
+async def _sync_bot_command_menus(bot, settings: Settings) -> None:
+    """Publish ordinary commands by default and elevated commands only per admin."""
+    try:
+        await bot.set_my_commands(_user_bot_commands(), scope=BotCommandScopeDefault())
+    except Exception:
+        LOGGER.exception("Could not set the default Telegram command menu")
+    connection = connect(settings.database_path, readonly=True)
+    try:
+        dynamic_admins = set(list_bot_admins(connection))
+    finally:
+        connection.close()
+    admin_ids = set(settings.admin_user_ids) | set(settings.primary_admin_user_ids) | dynamic_admins
+    for user_id in sorted(admin_ids):
+        await _sync_user_command_scope(bot, user_id, settings)
+
+
+async def admin_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_primary_admin(update, settings):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit() or int(context.args[0]) <= 0:
+        await update.effective_message.reply_text("روش درست: /admin_add 123456789")
+        return
+    user_id = int(context.args[0])
+    if is_admin(user_id, settings):
+        await update.effective_message.reply_text(f"شناسهٔ {user_id} از قبل مدیر است.")
+        return
+    connection = connect(settings.database_path)
+    try:
+        added = add_bot_admin(connection, user_id, update.effective_user.id)
+    finally:
+        connection.close()
+    if added:
+        await _sync_user_command_scope(context.bot, user_id, settings)
+    await update.effective_message.reply_text(
+        f"شناسهٔ {user_id} به مدیران اضافه شد و دسترسی مدیریتی گرفت."
+        if added else f"شناسهٔ {user_id} از قبل مدیر است."
+    )
+
+
+async def admin_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if await _deny_non_primary_admin(update, settings):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit() or int(context.args[0]) <= 0:
+        await update.effective_message.reply_text("روش درست: /admin_remove 123456789")
+        return
+    user_id = int(context.args[0])
+    if is_primary_admin(user_id, settings):
+        await update.effective_message.reply_text("نقش مدیر اصلی از داخل ربات قابل حذف نیست.")
+        return
+    if user_id in settings.admin_user_ids:
+        await update.effective_message.reply_text(
+            "این مدیر در ADMIN_USER_IDS فایل .env تعریف شده است؛ برای حذفش همان تنظیم را ویرایش و ربات را restart کنید."
+        )
+        return
+    connection = connect(settings.database_path)
+    try:
+        removed = remove_bot_admin(connection, user_id)
+    finally:
+        connection.close()
+    if removed:
+        # The admin-specific menu is deleted; the ordinary menu becomes visible.
+        await _sync_user_command_scope(context.bot, user_id, settings, remove_admin=True)
+    await update.effective_message.reply_text(
+        f"نقش مدیریتی شناسهٔ {user_id} حذف شد؛ اگر کاربر ثبت‌شده باشد، دسترسی عادی‌اش باقی می‌ماند."
+        if removed else f"شناسهٔ {user_id} مدیر پویای ثبت‌شده نبود."
+    )
 
 
 def _database_file_display_name(row: Any) -> str:
@@ -2054,8 +2324,10 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     settings: Settings = context.application.bot_data["settings"]
     if await _deny_non_admin(update, settings):
         return
+    primary_admin = is_primary_admin(update.effective_user.id, settings)
     await update.effective_message.reply_text(
-        _admin_panel_text(settings), reply_markup=_admin_keyboard(settings)
+        _admin_panel_text(settings, primary_admin=primary_admin),
+        reply_markup=_admin_keyboard(settings, primary_admin=primary_admin),
     )
 
 
@@ -2067,7 +2339,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.effective_chat or update.effective_chat.type != "private":
         await callback.answer("این پنل فقط در گفت‌وگوی خصوصی ربات کار می‌کند.", show_alert=True)
         return
-    if not is_admin(update.effective_user.id if update.effective_user else None, settings):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_admin(user_id, settings):
         await callback.answer("فقط مدیر مجاز است.", show_alert=True)
         return
     parts = (callback.data or "").split(":")
@@ -2075,6 +2348,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await callback.answer("درخواست نامعتبر است.", show_alert=True)
         return
     action, value = parts[1], parts[2]
+    primary_admin = is_primary_admin(user_id, settings)
+    if action == "home":
+        await callback.answer()
+        await callback.edit_message_text(
+            _admin_panel_text(settings, primary_admin=primary_admin),
+            reply_markup=_admin_keyboard(settings, primary_admin=primary_admin),
+        )
+        return
+    if action == "section":
+        await callback.answer()
+        text, keyboard = _admin_section_view(settings, value, primary_admin=primary_admin)
+        await callback.edit_message_text(text, reply_markup=keyboard)
+        return
     if action == "mode" and value in {"private", "public"}:
         connection = connect(settings.database_path)
         try:
@@ -2088,7 +2374,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except ValueError:
             await callback.answer("شناسه نامعتبر است.", show_alert=True)
             return
-        if user_id in settings.admin_user_ids:
+        if is_admin(user_id, settings):
             await callback.answer("دسترسی مدیر از این پنل حذف نمی‌شود.", show_alert=True)
             return
         connection = connect(settings.database_path)
@@ -2101,7 +2387,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await callback.answer("عملیات ناشناخته است.", show_alert=True)
         return
     await callback.edit_message_text(
-        _admin_panel_text(settings), reply_markup=_admin_keyboard(settings)
+        _admin_panel_text(settings, primary_admin=primary_admin),
+        reply_markup=_admin_keyboard(settings, primary_admin=primary_admin),
     )
 
 
@@ -2131,7 +2418,7 @@ async def user_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text("روش درست: /user_remove 123456789")
         return
     user_id = int(context.args[0])
-    if user_id in settings.admin_user_ids:
+    if is_admin(user_id, settings):
         await update.effective_message.reply_text("شناسه‌ی مدیر اصلی از این فهرست حذف نمی‌شود.")
         return
     connection = connect(settings.database_path)
@@ -2522,7 +2809,7 @@ def main() -> None:
     application.bot_data["settings"] = settings
     manager = UploadManager(settings, application.bot)
     application.bot_data["upload_manager"] = manager
-    search_queue = SearchQueue(respond_to_search)
+    search_queue = SearchQueue(process_queued_search)
     application.bot_data[SEARCH_QUEUE_KEY] = search_queue
     application.add_handler(TypeHandler(Update, search_busy_guard), group=-2)
     application.add_handler(TypeHandler(Update, log_update_received), group=-1)
@@ -2531,6 +2818,8 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("database", database_management_command))
     application.add_handler(CommandHandler("admin", admin_panel_command))
+    application.add_handler(CommandHandler("admin_add", admin_add_command))
+    application.add_handler(CommandHandler("admin_remove", admin_remove_command))
     application.add_handler(CommandHandler("user_add", user_add_command))
     application.add_handler(CommandHandler("user_remove", user_remove_command))
     application.add_handler(CommandHandler("access", access_command))
@@ -2561,6 +2850,8 @@ def main() -> None:
         LOGGER.info("operation=startup stage=post_init_started")
         await manager.start()
         LOGGER.info("operation=startup stage=upload_manager_started")
+        await _sync_bot_command_menus(app.bot, settings)
+        LOGGER.info("operation=startup stage=telegram_command_menus_synchronized")
 
     async def post_shutdown(app: Application) -> None:
         LOGGER.info("operation=shutdown stage=search_queue_stopping")

@@ -15,7 +15,9 @@ from database import (
     DatabaseRebuildRequired,
     SCHEMA_VERSION,
     access_mode,
+    add_bot_admin,
     add_bot_user,
+    bot_admin_exists,
     bot_user_exists,
     build_search_indexes,
     connect,
@@ -25,7 +27,9 @@ from database import (
     hide_header,
     initialize_access_control,
     initialize_database,
+    list_bot_admins,
     list_bot_users,
+    remove_bot_admin,
     remove_bot_user,
     set_access_mode,
     set_header_alias,
@@ -38,6 +42,8 @@ from bot import (
     format_record,
     format_full_text_record,
     format_search_preview,
+    is_admin,
+    is_primary_admin,
     download_file_with_progress,
     authorized,
     upload_authorized,
@@ -417,6 +423,53 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertFalse(upload_authorized(private_user, settings))
         set_access_mode(self.connection, "private")
 
+    def test_primary_and_dynamic_admin_roles_are_separate_and_persistent(self) -> None:
+        settings = replace(
+            self.settings,
+            admin_user_ids=frozenset({1, 2}),
+            primary_admin_user_ids=frozenset({1}),
+        )
+        self.assertTrue(is_primary_admin(1, settings))
+        self.assertFalse(is_primary_admin(2, settings))
+        self.assertTrue(is_admin(2, settings))  # Existing admins retain their privileges.
+        self.assertFalse(is_admin(303030, settings))
+        self.assertTrue(add_bot_admin(self.connection, 303030, 1))
+        self.assertTrue(bot_admin_exists(self.connection, 303030))
+        self.assertIn(303030, list_bot_admins(self.connection))
+        self.assertTrue(is_admin(303030, settings))
+        self.assertTrue(remove_bot_admin(self.connection, 303030))
+        self.assertFalse(is_admin(303030, settings))
+
+    def test_btree_index_build_reports_sqlite_progress_between_start_and_finish(self) -> None:
+        events: list[tuple[str, float]] = []
+        for index_name in (
+            "idx_records_phone_norm",
+            "idx_records_column_1_norm",
+            "idx_records_column_2_norm",
+            "idx_records_name_norm",
+            "idx_records_birth_date_norm",
+            "idx_records_record_hash",
+        ):
+            self.connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+        self.connection.execute("UPDATE metadata SET value = '0' WHERE key = 'search_indexes_ready'")
+        self.connection.commit()
+        with (
+            patch("database.INDEX_PROGRESS_HANDLER_INTERVAL_OPS", 1),
+            patch("database.INDEX_PROGRESS_MIN_PERCENT_STEP", 0.5),
+            patch("database.INDEX_PROGRESS_REPORT_INTERVAL_SECONDS", 3600),
+        ):
+            build_search_indexes(
+                self.connection,
+                force=False,
+                progress_callback=lambda stage, percent: events.append((stage, percent)),
+            )
+        phone_progress = [
+            percent for stage, percent in events
+            if stage == "ساخت شاخص idx_records_phone_norm"
+        ]
+        self.assertGreater(len(phone_progress), 1)
+        self.assertTrue(all(52.0 <= percent < 58.0 for percent in phone_progress))
+
     def test_selected_columns_only_are_searchable_but_full_row_is_hydrated(self) -> None:
         source = self.data_directory / "selected.csv"
         source.write_text(
@@ -536,6 +589,7 @@ class LegacySchemaTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
             self.assertIn("bot_users", tables)
+            self.assertIn("bot_admins", tables)
             self.assertIn("header_aliases", tables)
             self.assertIn("hidden_headers", tables)
             version = connection.execute(
@@ -557,6 +611,26 @@ class LegacySchemaTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
             self.assertIn("hidden_headers", tables)
+            self.assertIn("bot_admins", tables)
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertEqual(version, SCHEMA_VERSION)
+        finally:
+            connection.close()
+
+    def test_schema_v5_migration_adds_dynamic_admin_table(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        try:
+            initialize_database(connection)
+            connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+            connection.commit()
+            initialize_database(connection)
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            self.assertIn("bot_admins", tables)
             version = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]

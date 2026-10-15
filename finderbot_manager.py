@@ -54,6 +54,17 @@ def _systemd_active() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "active"
 
 
+def _systemctl_control(action: str) -> subprocess.CompletedProcess:
+    """Use the current root shell or sudo for actions that change the service."""
+    command = ["systemctl", action, f"{SERVICE_NAME}.service"]
+    if os.geteuid() != 0:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            return subprocess.CompletedProcess(command, 1, "", "sudo is not installed")
+        command = [sudo, *command]
+    return subprocess.run(command, check=False)
+
+
 def find_bot_pids(project_root: Path = PROJECT_ROOT) -> list[int]:
     """Find bot.py processes belonging to this project, not other bot instances."""
     expected_script = (project_root / "bot.py").resolve()
@@ -119,7 +130,7 @@ def start_bot(settings: Settings) -> bool:
         print("Install the project requirements first, or adjust the finderbot wrapper.")
         return False
     if _systemd_unit_for_project():
-        result = subprocess.run(["systemctl", "start", f"{SERVICE_NAME}.service"], check=False)
+        result = _systemctl_control("start")
         if result.returncode != 0:
             print("Could not start the systemd service. Check your permissions and journalctl logs.")
             return False
@@ -161,7 +172,7 @@ def start_bot(settings: Settings) -> bool:
 
 def stop_bot() -> bool:
     if _systemd_unit_for_project() and _systemd_active():
-        result = subprocess.run(["systemctl", "stop", f"{SERVICE_NAME}.service"], check=False)
+        result = _systemctl_control("stop")
         if result.returncode != 0:
             print("Could not stop the systemd service. Check your permissions and service logs.")
             return False

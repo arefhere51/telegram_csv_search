@@ -37,6 +37,7 @@ from database import (
 )
 from logging_utils import configure_logging
 from normalization import normalize_phone, normalize_text
+from progress_utils import RemainingTimeEstimator
 
 LOGGER = logging.getLogger("telegram_csv_search")
 CSV_SUFFIXES = {".csv", ".txt"}
@@ -263,29 +264,41 @@ def format_bytes(byte_count: int) -> str:
     return f"{byte_count} B"
 
 
+def _progress_position(file_handle) -> int:
+    """Read a safe approximate byte position after csv.reader advances the stream."""
+    try:
+        return max(0, int(file_handle.tell()))
+    except (OSError, ValueError):
+        try:
+            return max(0, int(file_handle.buffer.tell()))
+        except (AttributeError, OSError, ValueError):
+            return 0
+
+
 def _progress_metrics(file_size: int, file_handle, started: float) -> tuple[float, float]:
     elapsed = max(time.monotonic() - started, 0.001)
     # TextIOWrapper.tell() can raise after csv.reader has advanced via next().
     # The buffered binary stream still exposes a safe approximate byte position.
-    try:
-        position = file_handle.tell()
-    except (OSError, ValueError):
-        try:
-            position = file_handle.buffer.tell()
-        except (AttributeError, OSError, ValueError):
-            position = 0
+    position = _progress_position(file_handle)
     percent = min(position / file_size * 100, 100.0) if file_size else 100.0
     return elapsed, percent
 
 
 def _progress_message(
-    relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float
+    relative_path: str, processed: int, inserted: int, file_size: int, file_handle, started: float,
+    *, eta_estimator: RemainingTimeEstimator | None = None, finished: bool = False,
 ) -> str:
     """Localized progress text shown to users in the Telegram chat."""
     elapsed, percent = _progress_metrics(file_size, file_handle, started)
+    position = min(_progress_position(file_handle), file_size) if file_size else 0
+    eta = (
+        eta_estimator.estimate(position, file_size, finished=finished)
+        if eta_estimator is not None else "در حال برآورد بر اساس سرعت همین مرحله"
+    )
     return (
         f"فایل: {relative_path}؛ ردیف‌های خوانده‌شده: {processed:,}؛ ردیف‌های درج‌شده: {inserted:,}؛ "
-        f"زمان: {elapsed:.1f} ثانیه؛ سرعت: {processed / elapsed:,.0f} ردیف/ثانیه؛ پیشرفت: {percent:.1f}%"
+        f"زمان: {elapsed:.1f} ثانیه؛ سرعت: {processed / elapsed:,.0f} ردیف/ثانیه؛ پیشرفت: {percent:.1f}%\n"
+        f"زمان تقریبی باقی‌مانده برای مرحلهٔ ورود CSV: {eta}؛ ساخت شاخص‌ها جداگانه انجام می‌شود."
     )
 
 
@@ -336,6 +349,7 @@ def import_one_file(
     rows_inserted = 0
     batch: list[tuple] = []
     start = time.monotonic()
+    eta_estimator = RemainingTimeEstimator()
     last_progress_at = start
     indexes_ready = search_indexes_ready(connection)
     try:
@@ -420,7 +434,10 @@ def import_one_file(
                     rows_processed % settings.import_progress_every_rows == 0
                     or now - last_progress_at >= 2.0
                 ):
-                    message = _progress_message(relative_path, rows_processed, rows_inserted, stat.st_size, source, start)
+                    message = _progress_message(
+                        relative_path, rows_processed, rows_inserted, stat.st_size, source, start,
+                        eta_estimator=eta_estimator,
+                    )
                     LOGGER.info(_progress_log_message(
                         relative_path, rows_processed, rows_inserted, stat.st_size, source, start,
                     ))
@@ -446,7 +463,7 @@ def import_one_file(
                 relative_path, rows_processed, rows_inserted, stat.st_size,
                 # A tiny compatibility object avoids reopening a multi-GB file solely for final progress.
                 type("Progress", (), {"tell": lambda _: stat.st_size})(),
-                start,
+                start, eta_estimator=eta_estimator, finished=True,
             )
         LOGGER.info(_progress_log_message(
             relative_path, rows_processed, rows_inserted, stat.st_size,

@@ -5,7 +5,7 @@ import sys
 import unittest
 
 from logging_utils import RedactionFilter
-from progress_utils import progress_bar, progress_text
+from progress_utils import RemainingTimeEstimator, progress_bar, progress_text
 from upload_manager import UploadManager
 
 
@@ -42,6 +42,22 @@ class ProgressObservabilityTests(unittest.TestCase):
         self.assertIn("خواندن CSV", text)
         self.assertNotIn("کد پیگیری", text)
         self.assertNotIn("operation_id", text)
+
+    def test_eta_uses_observed_throughput_and_persian_time_units(self) -> None:
+        estimator = RemainingTimeEstimator(
+            minimum_elapsed_seconds=0,
+            minimum_progress_fraction=0,
+            smoothing=1,
+        )
+        self.assertIn("در حال برآورد", estimator.estimate(0, 100, now=0))
+        self.assertIn("در حال برآورد", estimator.estimate(10, 100, now=10))
+        # Observed speed is 1 unit/second; 80 units remain.
+        self.assertEqual(estimator.estimate(20, 100, now=20), "حدود ۱ دقیقه و ۲۰ ثانیه")
+        self.assertEqual(estimator.estimate(100, 100, now=100), "تکمیل شد")
+
+    def test_unknown_total_does_not_invent_an_eta(self) -> None:
+        estimator = RemainingTimeEstimator(minimum_elapsed_seconds=0)
+        self.assertIn("حجم کل", estimator.estimate(50, None, now=1))
 
 
 if __name__ == "__main__":

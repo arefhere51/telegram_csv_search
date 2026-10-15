@@ -12,12 +12,15 @@ from typing import Callable, Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 LOGGER = logging.getLogger("telegram_csv_search")
 SQLITE_WRITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = 120_000
 INDEX_BUILD_RETRIES = 4
 INDEX_RETRY_DELAYS_SECONDS = (1, 2, 4)
+INDEX_PROGRESS_HANDLER_INTERVAL_OPS = 20_000
+INDEX_PROGRESS_MIN_PERCENT_STEP = 1.0
+INDEX_PROGRESS_REPORT_INTERVAL_SECONDS = 2.5
 
 
 class DatabaseRebuildRequired(RuntimeError):
@@ -99,10 +102,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
             "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
         )
-    if stored_version not in {None, "2", "3", "4", SCHEMA_VERSION}:
+    if stored_version not in {None, "2", "3", "4", "5", SCHEMA_VERSION}:
         raise DatabaseRebuildRequired(
             f"Unsupported SQLite schema version {stored_version!r}; expected "
-            f"2, 3, 4 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+            f"2, 3, 4, 5 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
         )
     connection.executescript(
         """
@@ -158,6 +161,12 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY CHECK (user_id > 0),
+            added_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_admins (
             user_id INTEGER PRIMARY KEY CHECK (user_id > 0),
             added_by INTEGER NOT NULL,
             created_at TEXT NOT NULL
@@ -281,6 +290,38 @@ def remove_bot_user(connection: sqlite3.Connection, user_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+def list_bot_admins(connection: sqlite3.Connection) -> list[int]:
+    """Return dynamically promoted admins; environment-configured admins are separate."""
+    return [int(row[0]) for row in connection.execute("SELECT user_id FROM bot_admins ORDER BY user_id")]
+
+
+def bot_admin_exists(connection: sqlite3.Connection, user_id: int) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM bot_admins WHERE user_id = ?", (int(user_id),)
+    ).fetchone() is not None
+
+
+def add_bot_admin(connection: sqlite3.Connection, user_id: int, added_by: int) -> bool:
+    if int(user_id) <= 0:
+        raise ValueError("Telegram user ID must be positive.")
+    connection.execute(
+        "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
+        (int(user_id), int(added_by), utc_now()),
+    )
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO bot_admins(user_id, added_by, created_at) VALUES (?, ?, ?)",
+        (int(user_id), int(added_by), utc_now()),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def remove_bot_admin(connection: sqlite3.Connection, user_id: int) -> bool:
+    cursor = connection.execute("DELETE FROM bot_admins WHERE user_id = ?", (int(user_id),))
+    connection.commit()
+    return cursor.rowcount > 0
+
+
 def header_alias_key(header: str) -> str:
     import unicodedata
     return unicodedata.normalize("NFKC", str(header)).strip().casefold()
@@ -364,6 +405,25 @@ def search_indexes_ready(connection: sqlite3.Connection) -> bool:
     return get_metadata(connection, "search_indexes_ready") == "1"
 
 
+def _create_index_vm_ops_per_row(connection: sqlite3.Connection, statement: str) -> int:
+    """Estimate repeated virtual-machine operations per row from SQLite EXPLAIN."""
+    try:
+        instructions = list(connection.execute("EXPLAIN " + statement))
+    except sqlite3.Error:
+        return 9  # Fallback for SQLite variants that do not explain DDL.
+    repeated_ops = 0
+    for instruction_number, instruction in enumerate(instructions):
+        if str(instruction[1]) not in {"Next", "SorterNext", "Prev", "VNext"}:
+            continue
+        try:
+            loop_start = int(instruction[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= loop_start < instruction_number:
+            repeated_ops += instruction_number - loop_start + 1
+    return max(1, repeated_ops)
+
+
 def build_search_indexes(
     connection: sqlite3.Connection,
     *,
@@ -437,7 +497,41 @@ def build_search_indexes(
                 start_percent = 52.0 + index_number * 6.0
                 if progress_callback:
                     progress_callback(f"ساخت شاخص {index_name}", start_percent)
-                connection.execute(statement)
+                progress_ops_per_row = _create_index_vm_ops_per_row(connection, statement)
+                estimated_total_ops = max(1, record_count * progress_ops_per_row)
+                estimated_total_ticks = max(
+                    1,
+                    (estimated_total_ops + INDEX_PROGRESS_HANDLER_INTERVAL_OPS - 1)
+                    // INDEX_PROGRESS_HANDLER_INTERVAL_OPS,
+                )
+                progress_ticks = 0
+                last_reported_at = time.monotonic()
+                last_reported_percent = start_percent
+
+                def report_index_progress() -> int:
+                    nonlocal progress_ticks, last_reported_at, last_reported_percent
+                    progress_ticks += 1
+                    if progress_callback is None:
+                        return 0
+                    now = time.monotonic()
+                    fraction = min(progress_ticks / estimated_total_ticks, 0.98)
+                    current_percent = start_percent + 6.0 * fraction
+                    if (
+                        current_percent - last_reported_percent >= INDEX_PROGRESS_MIN_PERCENT_STEP
+                        or now - last_reported_at >= INDEX_PROGRESS_REPORT_INTERVAL_SECONDS
+                    ):
+                        progress_callback(f"ساخت شاخص {index_name}", current_percent)
+                        last_reported_at = now
+                        last_reported_percent = current_percent
+                    return 0
+
+                connection.set_progress_handler(
+                    report_index_progress, INDEX_PROGRESS_HANDLER_INTERVAL_OPS
+                )
+                try:
+                    connection.execute(statement)
+                finally:
+                    connection.set_progress_handler(None, 0)
                 if progress_callback:
                     progress_callback(f"شاخص {index_name} ساخته شد", start_percent + 6.0)
             if force:

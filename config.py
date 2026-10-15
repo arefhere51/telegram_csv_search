@@ -93,6 +93,7 @@ class Settings:
     telegram_file_base_url: str
     admin_user_ids: FrozenSet[int] = frozenset()
     initial_access_mode: str = "private"
+    primary_admin_user_ids: FrozenSet[int] = frozenset()
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(PROJECT_ROOT / ".env", override=False)
@@ -103,10 +104,26 @@ class Settings:
         configured_admins = os.getenv("ADMIN_USER_IDS", "").strip()
         # Backward compatible safe default: the first bootstrap user is the sole admin.
         if configured_admins:
-            admin_user_ids = _parse_user_ids(configured_admins, "ADMIN_USER_IDS")
+            configured_admin_ids = _parse_user_ids(configured_admins, "ADMIN_USER_IDS")
         else:
             first_allowed = next((item.strip() for item in os.getenv("ALLOWED_USER_IDS", "").split(",") if item.strip()), "")
-            admin_user_ids = frozenset({int(first_allowed)}) if first_allowed else frozenset()
+            configured_admin_ids = frozenset({int(first_allowed)}) if first_allowed else frozenset()
+        configured_primary = os.getenv("PRIMARY_ADMIN_USER_IDS", "").strip()
+        if configured_primary:
+            primary_admin_user_ids = _parse_user_ids(
+                configured_primary, "PRIMARY_ADMIN_USER_IDS"
+            )
+        else:
+            # Existing deployments keep every configured admin. The first one
+            # becomes the primary administrator for the new role hierarchy.
+            first_admin = next(iter(os.getenv("ADMIN_USER_IDS", "").split(",")), "").strip()
+            if not first_admin:
+                first_admin = next(
+                    (item.strip() for item in os.getenv("ALLOWED_USER_IDS", "").split(",") if item.strip()),
+                    "",
+                )
+            primary_admin_user_ids = frozenset({int(first_admin)}) if first_admin else frozenset()
+        admin_user_ids = configured_admin_ids | primary_admin_user_ids
         settings = cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             allowed_user_ids=allowed_user_ids,
@@ -143,6 +160,7 @@ class Settings:
             telegram_file_base_url=os.getenv("TELEGRAM_FILE_BASE_URL", "https://api.telegram.org/file/bot").rstrip("/"),
             admin_user_ids=admin_user_ids,
             initial_access_mode=os.getenv("ACCESS_MODE", "private").strip().lower(),
+            primary_admin_user_ids=primary_admin_user_ids,
         )
         if settings.results_per_page > settings.max_results:
             raise ConfigurationError("RESULTS_PER_PAGE cannot exceed MAX_RESULTS.")

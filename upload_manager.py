@@ -16,7 +16,7 @@ from telegram.error import BadRequest
 from config import Settings
 from database import build_search_indexes, connect, initialize_database, seed_dedupe_hashes
 from import_csv import import_one_file
-from progress_utils import progress_text
+from progress_utils import RemainingTimeEstimator, progress_text
 
 LOGGER = logging.getLogger("telegram_csv_search")
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -155,6 +155,57 @@ class UploadManager:
         loop = asyncio.get_running_loop()
         last_status = 0.0
         pending_status_updates: list[tuple[str, Any]] = []
+        index_eta: dict[str, tuple[RemainingTimeEstimator, float, float]] = {}
+
+        def index_stage_eta(stage: str, percent: float) -> str:
+            """Estimate only within the current index substage, never reuse CSV speed."""
+            if "انتظار برای آزادشدن" in stage or "قفل موقت" in stage:
+                return "تا آزادشدن قفل SQLite قابل برآورد نیست"
+            if "قفل نوشتن گرفته شد" in stage:
+                return "اندازه‌گیری زمان FTS آغاز می‌شود"
+            if "FTS" in stage:
+                key, start, end = "fts_rebuild", 5.0, 52.0
+                completed = max(0.0, min(percent - start, end - start))
+                estimator = index_eta.setdefault(key, (RemainingTimeEstimator(), start, end))[0]
+                return estimator.estimate(
+                    completed, end - start,
+                    finished=("کامل شد" in stage or percent >= end),
+                )
+            if stage.startswith("ساخت شاخص "):
+                name = stage.removeprefix("ساخت شاخص ")
+                saved = index_eta.get(name)
+                if saved is None:
+                    start = percent
+                    end = min(start + 6.0, 100.0)
+                    saved = (RemainingTimeEstimator(), start, end)
+                    index_eta[name] = saved
+                estimator, start, end = saved
+                if percent >= start + (end - start) * 0.95:
+                    return "نزدیک پایان؛ شاخص‌سازی هنوز در حال اجراست"
+                return estimator.estimate(
+                    max(0.0, min(percent - start, end - start)), end - start
+                )
+            if stage.startswith("شاخص ") and " ساخته شد" in stage:
+                name = stage.removeprefix("شاخص ").removesuffix(" ساخته شد")
+                saved = index_eta.get(name)
+                if saved is None:
+                    return "تکمیل شد"
+                estimator, start, end = saved
+                return estimator.estimate(end - start, end - start, finished=True)
+            if "بازسازی نهایی شاخص‌های B-tree" in stage or "بازسازی نهایی B-tree" in stage:
+                key, start, end = "btree_reindex", 90.0, 97.0
+                estimator = index_eta.setdefault(key, (RemainingTimeEstimator(), start, end))[0]
+                return estimator.estimate(
+                    max(0.0, min(percent - start, end - start)), end - start,
+                    finished=("کامل" in stage or percent >= end),
+                )
+            if (
+                "ساخت همهٔ شاخص‌ها کامل شد" in stage
+                or "شاخص‌ها از قبل آماده‌اند" in stage
+                or "شاخص‌ها توسط فرایند دیگری آماده شدند" in stage
+            ):
+                return "تکمیل شد"
+            return "در حال برآورد بر اساس سرعت همین مرحله"
 
         async def flush_progress_updates() -> None:
             pending = list(pending_status_updates)
@@ -188,6 +239,7 @@ class UploadManager:
             pending_status_updates.append(("csv_import_progress", future))
 
         def index_progress(stage: str, percent: float) -> None:
+            nonlocal last_status
             if stage.startswith("ساخت شاخص "):
                 stage_code = "btree_index_build"
                 index_name = stage.removeprefix("ساخت شاخص ")
@@ -206,6 +258,17 @@ class UploadManager:
             else:
                 stage_code = "index_preparation"
                 index_name = "-"
+            eta_text = index_stage_eta(stage, percent)
+            now = time.monotonic()
+            terminal = (
+                "ساخته شد" in stage
+                or "کامل شد" in stage
+                or "آماده‌اند" in stage
+                or "آماده شدند" in stage
+            )
+            if now - last_status < self.settings.upload_progress_interval_seconds and not terminal:
+                return
+            last_status = now
             LOGGER.info(
                 "operation=upload stage=%s index=%s progress=%.1f filename=%s",
                 stage_code, index_name, percent, job.original_filename,
@@ -218,7 +281,10 @@ class UploadManager:
                             "🧱 آماده‌سازی شاخص جست‌وجو",
                             stage,
                             percent,
-                            detail=job.original_filename,
+                            detail=(
+                                f"{job.original_filename}\n"
+                                f"زمان تقریبی باقی‌مانده برای این مرحله: {eta_text}"
+                            ),
                         ),
                     ),
                     loop,
@@ -342,7 +408,8 @@ class UploadManager:
                 100,
                 detail=(
                     f"{job.original_filename}\nرکوردهای خوانده‌شده: {processed:,}\n"
-                    f"رکوردهای درج‌شده: {inserted:,}\nفایل اصلی به‌عنوان منبع داده نگه داشته شد."
+                    f"رکوردهای درج‌شده: {inserted:,}\nفایل اصلی به‌عنوان منبع داده نگه داشته شد.\n"
+                    "زمان تقریبی باقی‌مانده: تکمیل شد."
                 ),
             ),
         )

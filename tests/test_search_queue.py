@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from threading import Event
 from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from telegram.ext import ApplicationHandlerStop
-from bot import search_busy_guard
+from bot import process_queued_search, search_busy_guard
 from search_queue import SearchQueue
 
 
@@ -47,6 +49,28 @@ def make_context():
 
 
 class SearchQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_adapter_passes_settings_and_raw_query_to_search_handler(self):
+        context = make_context()
+        update, message = make_update(100)
+        called = asyncio.Event()
+
+        async def fake_respond(*args, **kwargs):
+            called.set()
+
+        queue = SearchQueue(process_queued_search)
+        with patch("bot.respond_to_search", new_callable=AsyncMock, side_effect=fake_respond) as responder:
+            try:
+                await queue.submit(update, context, "Ali")
+                await asyncio.wait_for(called.wait(), timeout=1)
+                self.assertEqual(responder.await_count, 1)
+                args = responder.await_args.args
+                kwargs = responder.await_args.kwargs
+                self.assertEqual(args, (update, context, context.application.bot_data["settings"], "Ali"))
+                self.assertIs(kwargs["status_message"], message.replies[0])
+                self.assertIsInstance(kwargs["cancellation_event"], Event)
+            finally:
+                await queue.stop()
+
     async def test_fifo_queue_duplicate_rejection_and_queue_position(self):
         first_started = asyncio.Event()
         release_first = asyncio.Event()
