@@ -41,7 +41,11 @@ class SearchQueue:
         if user_id is None:
             return False
         return bool(
-            (self._active and self._active.user_id == user_id)
+            (
+                self._active
+                and self._active.user_id == user_id
+                and not self._active.cancel_event.is_set()
+            )
             or user_id in self._pending_by_user
         )
 
