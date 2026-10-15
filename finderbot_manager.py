@@ -9,6 +9,8 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from config import Settings, load_settings
 
@@ -24,6 +26,10 @@ SERVICE_NAME = "telegram-csv-search"
 PID_FILE = PROJECT_ROOT / "run" / "finderbot.pid"
 CONSOLE_LOG_NAME = "finderbot-console.log"
 STOP_TIMEOUT_SECONDS = 20
+GITHUB_REPOSITORY = "https://github.com/arefhere51/telegram_csv_search.git"
+GITHUB_BRANCH = "main"
+GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/arefhere51/telegram_csv_search/main"
+UPDATE_RELEASE_MARKER = "FINDERBOT_RELEASE_20261015_FULL_FIELDS_AND_MENU_UPDATE"
 
 
 def _systemd_available() -> bool:
@@ -251,6 +257,95 @@ def rebuild_indexes_and_restart(settings: Settings) -> bool:
     return start_bot(settings)
 
 
+def update_from_github(project_root: Path = PROJECT_ROOT) -> bool:
+    """Run the repository's data-preserving installer, then start the new version."""
+    project_root = project_root.resolve()
+    installer = project_root / "install.sh"
+    if not installer.is_file():
+        print(f"Update installer not found: {installer}")
+        return False
+    try:
+        with urlopen(f"{GITHUB_RAW_ROOT}/finderbot_manager.py", timeout=20) as response:
+            remote_manager = response.read(256 * 1024).decode("utf-8", errors="replace")
+    except (OSError, URLError) as exc:
+        print(f"Could not check the latest GitHub release: {exc}")
+        print("No files were changed and the bot was not stopped.")
+        return False
+    if UPDATE_RELEASE_MARKER not in remote_manager:
+        print("The GitHub main branch does not yet contain this release.")
+        print("Update was blocked to prevent replacing this version with older code.")
+        print("Publish this release to the repository first, then run FinderBot update again.")
+        return False
+    print("\nFinderBot will download the latest source from the public GitHub main branch.")
+    print("The project code will be replaced; .env, databases, CSV files, logs, and virtualenv are preserved.")
+    print("The bot will be stopped during the update and started again afterward.")
+    try:
+        answer = input("To continue, type exactly UPDATE: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("Update cancelled.")
+        return False
+    if answer != "UPDATE":
+        print("Update cancelled.")
+        return False
+
+    systemd_mode = _systemd_available()
+    mode = "systemd" if systemd_mode else "foreground"
+    if not systemd_mode and not stop_bot():
+        print("Update was not started because the running bot could not be stopped.")
+        return False
+
+    command = ["bash", str(installer), "--mode", mode, "--no-start"]
+    environment = os.environ.copy()
+    environment.update({
+        "PROJECT_DIR": str(project_root),
+        "REPO_URL": GITHUB_REPOSITORY,
+        "BRANCH": GITHUB_BRANCH,
+    })
+    if systemd_mode and os.geteuid() != 0:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            print("Updating the systemd installation requires root or sudo.")
+            return False
+        command = [
+            sudo,
+            "env",
+            f"PROJECT_DIR={project_root}",
+            f"REPO_URL={GITHUB_REPOSITORY}",
+            f"BRANCH={GITHUB_BRANCH}",
+            *command,
+        ]
+        environment = os.environ.copy()
+
+    print(f"Updating from {GITHUB_REPOSITORY} (branch {GITHUB_BRANCH})...")
+    try:
+        update_result = subprocess.run(command, cwd=project_root, env=environment, check=False)
+    except OSError as exc:
+        print(f"Could not run the updater: {exc}")
+        return False
+    if update_result.returncode != 0:
+        print(f"Update failed with exit code {update_result.returncode}; check the installer output above.")
+        print("The bot may be stopped; inspect the installer output before starting it manually.")
+        return False
+
+    wrapper = project_root / "finderbot"
+    if not wrapper.is_file():
+        print(f"Updated source is missing the FinderBot launcher: {wrapper}")
+        return False
+    print("Update downloaded and installed. Starting the bot with the updated code...")
+    try:
+        start_result = subprocess.run([str(wrapper), "start"], cwd=project_root, check=False)
+    except OSError as exc:
+        print(f"The update completed, but FinderBot could not be started: {exc}")
+        return False
+    if start_result.returncode != 0:
+        print(f"The update completed, but FinderBot did not start (exit code {start_result.returncode}).")
+        print("Check the service or bot log before retrying.")
+        return False
+    print("Update and restart completed successfully.")
+    print("This menu was opened by the previous version; run finderbot again to use the updated menu.")
+    return True
+
+
 def _safe_managed_directory(path: Path, label: str, project_root: Path) -> Path:
     candidate = path.expanduser().resolve(strict=False)
     root = project_root.resolve()
@@ -438,6 +533,7 @@ def show_menu(settings: Settings) -> None:
         print("3) Restart bot")
         print("4) Delete all databases and downloaded bot files")
         print("5) Rebuild search indexes and restart bot")
+        print("6) Update FinderBot from GitHub and restart")
         print("0) Exit")
         try:
             choice = input("> ").strip()
@@ -454,11 +550,14 @@ def show_menu(settings: Settings) -> None:
             delete_all_data(settings)
         elif choice == "5":
             rebuild_indexes_and_restart(settings)
+        elif choice == "6":
+            if update_from_github():
+                return
         elif choice == "0":
             print("Exiting FinderBot manager.")
             return
         else:
-            print("Invalid selection. Enter 0, 1, 2, 3, 4, or 5.")
+            print("Invalid selection. Enter 0, 1, 2, 3, 4, 5, or 6.")
         try:
             input("\nPress Enter to return to the menu...")
         except (EOFError, KeyboardInterrupt):
@@ -487,7 +586,9 @@ def main() -> int:
             return 0 if stop_bot() else 1
         if command == "restart":
             return 0 if restart_bot(settings) else 1
-        print("Usage: finderbot [status|start|stop|restart]", file=sys.stderr)
+        if command == "update":
+            return 0 if update_from_github() else 1
+        print("Usage: finderbot [status|start|stop|restart|update]", file=sys.stderr)
         return 2
     show_menu(settings)
     return 0

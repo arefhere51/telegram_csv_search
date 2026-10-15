@@ -128,6 +128,24 @@ class ResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake_bot.documents, [])
         exporter.assert_not_called()
 
+    async def test_long_small_result_uses_txt_to_preserve_complete_fields(self) -> None:
+        result = SimpleNamespace(total_count=1, mode="text", rows=[])
+        full_preview = "address: " + "کوچه " * 900 + "انتهای نشانی"
+        with (
+            patch("bot.run_search", return_value=result),
+            patch("bot.load_display_header_aliases", return_value={}),
+            patch("bot.load_hidden_header_keys", return_value=set()),
+            patch("bot.format_search_preview", return_value=full_preview),
+            patch("bot.write_search_text_exports", side_effect=self._exporter) as exporter,
+        ):
+            await bot.respond_to_search(self.update, self.context, self.settings, "نشانی")
+
+        exporter.assert_called_once()
+        self.assertEqual(len(self.fake_bot.documents), 1)
+        self.assertEqual(len(self.message.replies), 1)  # status only; no clipped preview
+        self.assertIn("محتوای کامل رکوردها", self.message.status.edits[-1])
+        self.assertIn("تعداد کل رکوردهای یافت‌شده: 1", self.fake_bot.documents[0]["caption"])
+
     async def test_timeout_shows_problem_message_after_send_wait_expires(self) -> None:
         result = SimpleNamespace(total_count=9, mode="text", rows=[])
 

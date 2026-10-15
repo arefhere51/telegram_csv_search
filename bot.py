@@ -338,11 +338,11 @@ def format_record(
         for i in range(field_count)
         if header_alias_key(str(headers[i]) if i < len(headers) else f"Column {i + 1}") not in hidden
     ]
-    source_budget = min(settings.max_field_display_chars, 315)
-    allocation = max(24, source_budget // max(len(values) + 1, 1))
     lines = ["━━━━━━━━━━━━━━━━━━"]
     for label, value in values:
-        rendered = truncate(value, allocation) if value else "—"
+        # Preserve complete values. A whole message is moved to the TXT fallback
+        # when it cannot fit Telegram's message-size limit.
+        rendered = value if value else "—"
         lines.append(f"<b>{escape(label)}:</b> {escape(rendered)}")
     lines.append(f"<b>منبع:</b> {escape(str(row['source_file']))}:{row['source_line']}")
     return "\n".join(lines)
@@ -388,7 +388,7 @@ def format_search_preview(
         format_record(row, i + 1, settings, header_aliases, hidden_headers)
         for i, row in enumerate(rows)
     )
-    return text if len(text) <= 3900 else text[:3899].rsplit("\n", 1)[0] + "\n…"
+    return text
 
 
 def write_search_text_exports(
@@ -485,34 +485,26 @@ def write_search_text_exports(
 
 
 def page_needs_full_csv(
-    result: SearchPage, settings: Settings, hidden_headers: set[str] | None = None
+    result: SearchPage,
+    settings: Settings,
+    hidden_headers: set[str] | None = None,
+    header_aliases: dict[str, str] | None = None,
+    *,
+    query: str = "",
+    page: int = 0,
+    max_chars: int = 3900,
 ) -> bool:
-    """Return true if the chat preview would shorten values or exceed Telegram limits."""
-    if len(format_page("", 0, result, settings, hidden_headers=hidden_headers)) > 3900:
-        return True
-    for row in result.rows:
-        raw_fields = parse_raw_fields(row)
-        try:
-            headers = json.loads(row["headers_json"] or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            headers = []
-        hidden = hidden_headers or set()
-        visible_indices = [
-            index for index in range(max(len(headers), len(raw_fields)))
-            if header_alias_key(
-                str(headers[index]) if index < len(headers) else f"Column {index + 1}"
-            ) not in hidden
-        ]
-        field_count = len(visible_indices)
-        source_budget = min(settings.max_field_display_chars, 315)
-        allocation = max(24, source_budget // max(field_count + 1, 1))
-        if any(
-            len(raw_fields[index]) > allocation
-            for index in visible_indices
-            if index < len(raw_fields) and raw_fields[index]
-        ):
-            return True
-    return False
+    """Return true only when the complete page cannot fit in a Telegram message."""
+    complete_page = format_page(
+        query,
+        page,
+        result,
+        settings,
+        header_aliases=header_aliases,
+        hidden_headers=hidden_headers,
+        max_chars=None,
+    )
+    return len(complete_page) > max_chars
 
 
 def full_results_csv_bytes(
@@ -566,6 +558,7 @@ def format_page(
     full_csv_attached: bool = False,
     header_aliases: dict[str, str] | None = None,
     hidden_headers: set[str] | None = None,
+    max_chars: int | None = 3900,
 ) -> str:
     visible_total = min(result.total_count, settings.max_results)
     start = page * settings.results_per_page + 1
@@ -588,10 +581,10 @@ def format_page(
         format_record(row, start + offset, settings, header_aliases, hidden_headers)
         for offset, row in enumerate(result.rows)
     ]
-    # The construction budgets each record; this final cap additionally protects unusual
-    # escape expansion. Result metadata remains intact if a pathological row is encountered.
     message = header + "\n".join(records)
-    return message if len(message) <= 3900 else message[:3899].rsplit("\n", 1)[0] + "\n…"
+    if max_chars is None or len(message) <= max_chars:
+        return message
+    return message[: max(max_chars - 1, 1)].rsplit("\n", 1)[0] + "\n…"
 
 
 def pagination_keyboard(token: str, page: int, total_count: int, settings: Settings) -> InlineKeyboardMarkup | None:
@@ -713,30 +706,37 @@ async def respond_to_search(
         mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(
             result.mode, "جست‌وجو"
         )
+        preview_requires_txt = False
         if result.total_count <= SEARCH_PREVIEW_LIMIT:
             preview = format_search_preview(query, result, settings, aliases, hidden_headers)
             check_search_cancellation(cancellation_event)
-            LOGGER.info(
-                "operation=search stage=preview_ready user_id=%s results=%d",
-                update.effective_user.id, result.total_count,
-            )
-            await status.edit_text(
-                progress_text(
-                    "✅ جست‌وجو کامل شد",
-                    "نتیجه آماده است",
-                    100,
-                    detail=(
-                        f"عبارت جست‌وجو: {escape(query)}\nنوع جست‌وجو: {mode_label}\n"
-                        f"تعداد کل نتیجه‌ها: {result.total_count:,}"
-                    ),
+            if len(preview) <= 3900:
+                LOGGER.info(
+                    "operation=search stage=preview_ready user_id=%s results=%d",
+                    update.effective_user.id, result.total_count,
                 )
+                await status.edit_text(
+                    progress_text(
+                        "✅ جست‌وجو کامل شد",
+                        "نتیجه آماده است",
+                        100,
+                        detail=(
+                            f"عبارت جست‌وجو: {escape(query)}\nنوع جست‌وجو: {mode_label}\n"
+                            f"تعداد کل نتیجه‌ها: {result.total_count:,}"
+                        ),
+                    )
+                )
+                await update.effective_message.reply_text(
+                    preview,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+            preview_requires_txt = True
+            LOGGER.info(
+                "operation=search stage=long_preview_redirected_to_txt user_id=%s results=%d chars=%d",
+                update.effective_user.id, result.total_count, len(preview),
             )
-            await update.effective_message.reply_text(
-                preview,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            return
 
         await status.edit_text(progress_text(
             "📄 ساخت فایل نتیجه‌ها",
@@ -825,10 +825,12 @@ async def respond_to_search(
                     len(paths), result.total_count, min(result.total_count, SEARCH_EXPORT_MAX_RECORDS),
                 )
                 exported_count = min(result.total_count, SEARCH_EXPORT_MAX_RECORDS)
-                cap_note = (
-                    "\nفقط ۲۰۰۰ نتیجهٔ اول در فایل آمده است؛ لطفاً دقیق‌تر جست‌وجو کنید."
-                    if result.total_count > SEARCH_EXPORT_MAX_RECORDS else ""
-                )
+                notes: list[str] = []
+                if result.total_count > SEARCH_EXPORT_MAX_RECORDS:
+                    notes.append("فقط ۲۰۰۰ نتیجهٔ اول در فایل آمده است؛ لطفاً دقیق‌تر جست‌وجو کنید.")
+                if preview_requires_txt:
+                    notes.append("به‌دلیل طول زیاد متن، محتوای کامل رکوردها در این فایل آمده است.")
+                cap_note = "\n" + "\n".join(notes) if notes else ""
                 await status.edit_text(progress_text(
                     "✅ جست‌وجو کامل شد",
                     "فایل نتیجه آماده و در پیام بعدی ارسال می‌شود",
@@ -2714,14 +2716,23 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         asyncio.to_thread(load_display_header_aliases, settings),
         asyncio.to_thread(load_hidden_header_keys, settings),
     )
-    needs_full_csv = page_needs_full_csv(result, settings, hidden_headers)
+    completion_text = progress_text("✅ صفحه آماده شد", "در حال نمایش نتیجه‌ها", 100)
+    page_budget = max(100, 3900 - len(completion_text) - 1)
+    needs_full_csv = page_needs_full_csv(
+        result,
+        settings,
+        hidden_headers,
+        aliases,
+        query=session.query,
+        page=page,
+        max_chars=page_budget,
+    )
     LOGGER.info(
         "operation=pagination stage=query_complete page=%d results=%d full_csv=%s",
         page + 1, len(result.rows), needs_full_csv,
     )
     await callback.edit_message_text(
-        progress_text("✅ صفحه آماده شد", "در حال نمایش نتیجه‌ها", 100)
-        + "\n"
+        completion_text + "\n"
         + format_page(
             session.query,
             page,
@@ -2730,6 +2741,7 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             full_csv_attached=needs_full_csv,
             header_aliases=aliases,
             hidden_headers=hidden_headers,
+            max_chars=page_budget,
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=pagination_keyboard(token, page, result.total_count, settings),

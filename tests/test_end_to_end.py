@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -276,6 +277,36 @@ class ImportAndSearchTests(unittest.TestCase):
         self.assertIn("09120000000", rendered)
         self.assertIn("address:</b> —", rendered)
 
+    def test_long_field_is_not_truncated_in_preview(self) -> None:
+        long_address = "اصفهان " + "خیابان هزارجریب کوی امام جعفر صادق " * 35 + "پلاک ۱۶ انتهای نشانی"
+        row = {
+            "headers_json": '["address"]',
+            "raw_fields_json": json.dumps([long_address], ensure_ascii=False),
+            "source_file": "people.csv",
+            "source_line": 2,
+        }
+        rendered = format_record(row, 1, self.settings)
+        self.assertIn(long_address, rendered)
+        short_preview = format_search_preview(
+            "اصفهان",
+            SimpleNamespace(total_count=1, mode="text", rows=[row]),
+            self.settings,
+        )
+        self.assertIn(long_address, short_preview)
+
+        very_long_value = "نشانی-" + "کوچه-" * 1000 + "انتهای-کامل"
+        huge_row = {
+            "headers_json": '["address"]',
+            "raw_fields_json": json.dumps([very_long_value], ensure_ascii=False),
+            "source_file": "people.csv",
+            "source_line": 3,
+        }
+        huge_result = SimpleNamespace(total_count=1, mode="text", rows=[huge_row])
+        huge_preview = format_search_preview("نشانی", huge_result, self.settings)
+        self.assertGreater(len(huge_preview), 3900)
+        self.assertIn("انتهای-کامل", huge_preview)
+        self.assertTrue(page_needs_full_csv(huge_result, self.settings))
+
     def test_telegram_file_url_handles_relative_and_absolute_paths(self) -> None:
         relative = telegram_file_download_url(self.settings, "documents/file_7.csv")
         self.assertEqual(
@@ -492,7 +523,7 @@ class ImportAndSearchTests(unittest.TestCase):
         full_fields = parse_raw_fields(by_name.rows[0])
         self.assertEqual(full_fields[:3], ["786543", "سمانه", "09123456789"])
         self.assertTrue(full_fields[3].endswith("آزادی"))
-        self.assertTrue(page_needs_full_csv(by_name, self.settings))
+        self.assertFalse(page_needs_full_csv(by_name, self.settings))
         complete_csv = full_results_csv_bytes("سمانه", 0, by_name).decode("utf-8-sig")
         self.assertIn("09123456789", complete_csv)
         self.assertIn(full_fields[3], complete_csv)

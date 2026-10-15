@@ -4,8 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from finderbot_manager import cleanup_plan, delete_all_bot_data
+from finderbot_manager import (
+    UPDATE_RELEASE_MARKER,
+    cleanup_plan,
+    delete_all_bot_data,
+    update_from_github,
+)
 
 
 class FinderBotManagerCleanupTests(unittest.TestCase):
@@ -73,6 +79,69 @@ class FinderBotManagerCleanupTests(unittest.TestCase):
             cleanup_plan(unsafe, self.root)
         with self.assertRaisesRegex(ValueError, "unsafe data directory"):
             delete_all_bot_data(unsafe, self.root)
+
+
+class FinderBotManagerUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "telegram_csv_search"
+        self.root.mkdir()
+        (self.root / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.root / "finderbot").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_update_downloads_main_preserving_project_and_restarts_new_launcher(self) -> None:
+        completed = SimpleNamespace(returncode=0)
+        remote_response = MagicMock()
+        remote_response.__enter__.return_value.read.return_value = UPDATE_RELEASE_MARKER.encode()
+        with (
+            patch("finderbot_manager.urlopen", return_value=remote_response),
+            patch("builtins.input", return_value="UPDATE"),
+            patch("finderbot_manager._systemd_available", return_value=False),
+            patch("finderbot_manager.stop_bot", return_value=True),
+            patch("finderbot_manager.subprocess.run", side_effect=[completed, completed]) as run,
+        ):
+            self.assertTrue(update_from_github(self.root))
+
+        install_command = run.call_args_list[0].args[0]
+        install_environment = run.call_args_list[0].kwargs["env"]
+        self.assertIn("--no-start", install_command)
+        self.assertEqual(install_environment["PROJECT_DIR"], str(self.root.resolve()))
+        self.assertEqual(
+            install_environment["REPO_URL"],
+            "https://github.com/arefhere51/telegram_csv_search.git",
+        )
+        self.assertEqual(install_environment["BRANCH"], "main")
+        self.assertEqual(run.call_args_list[1].args[0], [str(self.root / "finderbot"), "start"])
+
+    def test_update_requires_exact_confirmation_before_stopping_or_network_calls(self) -> None:
+        remote_response = MagicMock()
+        remote_response.__enter__.return_value.read.return_value = UPDATE_RELEASE_MARKER.encode()
+        with (
+            patch("finderbot_manager.urlopen", return_value=remote_response),
+            patch("builtins.input", return_value="no"),
+            patch("finderbot_manager.stop_bot") as stop,
+            patch("finderbot_manager.subprocess.run") as run,
+        ):
+            self.assertFalse(update_from_github(self.root))
+        stop.assert_not_called()
+        run.assert_not_called()
+
+    def test_update_refuses_to_roll_back_when_main_does_not_have_this_release(self) -> None:
+        remote_response = MagicMock()
+        remote_response.__enter__.return_value.read.return_value = b"older repository version"
+        with (
+            patch("finderbot_manager.urlopen", return_value=remote_response),
+            patch("builtins.input") as prompt,
+            patch("finderbot_manager.stop_bot") as stop,
+            patch("finderbot_manager.subprocess.run") as run,
+        ):
+            self.assertFalse(update_from_github(self.root))
+        prompt.assert_not_called()
+        stop.assert_not_called()
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
