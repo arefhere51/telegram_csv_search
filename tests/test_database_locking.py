@@ -44,6 +44,48 @@ class _FailOnceIndexConnection:
 
 
 class DatabaseLockingTests(unittest.TestCase):
+    def test_schema_7_is_accepted_and_search_activity_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connection = connect(Path(temporary_directory) / "schema7.db")
+            try:
+                initialize_database(connection)
+                connection.execute(
+                    """INSERT INTO search_activity (
+                           started_at, telegram_user_id, status, query_text
+                       ) VALUES ('2026-10-17T00:00:00+00:00', 123, 'completed', 'test')"""
+                )
+                connection.execute(
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'"
+                )
+                connection.commit()
+
+                initialize_database(connection)
+                self.assertEqual(get_metadata(connection, "schema_version"), "7")
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM search_activity").fetchone()[0], 1
+                )
+            finally:
+                connection.close()
+
+    def test_schema_6_is_upgraded_to_7_without_rebuilding_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connection = connect(Path(temporary_directory) / "schema6.db")
+            try:
+                initialize_database(connection)
+                connection.execute(
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
+                )
+                connection.commit()
+                initialize_database(connection)
+                self.assertEqual(get_metadata(connection, "schema_version"), "7")
+                self.assertIsNotNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_activity'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+
     def test_write_connection_uses_disk_backed_bounded_sqlite_caches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             connection = connect(Path(temporary_directory) / "memory.db")
