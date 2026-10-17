@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 import httpx
 from telegram import (
     BotCommand,
-    BotCommandScopeChat,
+    BotCommandScopeChatMember,
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -57,7 +57,6 @@ from google_drive import (
     parse_drive_share_link,
 )
 from database import (
-    DATABASE_OPERATION_LOCK,
     access_mode as db_access_mode,
     add_bot_admin,
     add_bot_user,
@@ -92,7 +91,6 @@ from search import SearchPage, parse_raw_fields, search_records
 from upload_manager import UploadJob, UploadManager, safe_upload_path
 from import_csv import read_csv_header
 from search_queue import SearchQueue
-from search_audit import dashboard_metrics, export_report, finish_event, start_event
 
 LOGGER = logging.getLogger("telegram_csv_search")
 SESSION_KEY = "search_sessions"
@@ -102,7 +100,6 @@ SEARCH_QUEUE_KEY = "search_queue"
 UPLOAD_CANCELLATIONS_KEY = "upload_cancellation_events"
 MAX_SESSIONS_PER_USER = 25
 UPLOAD_HEADER_PAGE_SIZE = 8
-GUIDED_SEARCH_KEY = "guided_search"
 SEARCH_PREVIEW_LIMIT = 5
 SEARCH_EXPORT_MAX_RECORDS = 2000
 SEARCH_EXPORT_PAGE_SIZE = 1000
@@ -300,16 +297,10 @@ async def search_busy_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             LOGGER.exception("operation=search_queue stage=callback_busy_alert_failed user_id=%s", user_id)
     elif message:
-        if queue is not None and queue.is_user_cancelling(user_id):
-            await message.reply_text(
-                "لغو جست‌وجوی قبلی هنوز کامل نشده است؛ این درخواست ثبت یا وارد صف نشد. "
-                "بعد از پایان لغو، دوباره جست‌وجو کنید."
-            )
-        else:
-            await message.reply_text(
-                "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
-                "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
-            )
+        await message.reply_text(
+            "در حال پردازش درخواست قبلی شما هستم؛ درخواست جدید ثبت نشد. "
+            "برای لغو جست‌وجوهای خودتان و شروع دوباره، /start را بزنید."
+        )
     raise ApplicationHandlerStop
 
 
@@ -412,14 +403,12 @@ def write_search_text_exports(
     progress_callback: Callable[[int, int], None] | None = None,
     max_results: int | None = None,
     hidden_headers: set[str] | None = None,
-    cancellation_event: Event | None = None,
 ) -> list[Path]:
     """Stream up to max_results matching records to bounded UTF-8 TXT chunks."""
     if page_size < 1 or max_chunk_bytes < 4:
         raise ValueError("page_size must be positive and max_chunk_bytes must be at least 4.")
     export_settings = replace(settings, results_per_page=page_size)
-    check_search_cancellation(cancellation_event)
-    first = run_search(export_settings, query, 0, cancellation_event=cancellation_event)
+    first = run_search(export_settings, query, 0)
     total = first.total_count
     export_total = min(total, max_results) if max_results is not None else total
     if export_total <= 0:
@@ -467,18 +456,11 @@ def write_search_text_exports(
 
     try:
         for page in range(math.ceil(export_total / page_size)):
-            check_search_cancellation(cancellation_event)
             result = first if page == 0 else run_search(
-                export_settings,
-                query,
-                page,
-                mode=first.mode,
-                count_total=False,
-                cancellation_event=cancellation_event,
+                export_settings, query, page, mode=first.mode, count_total=False
             )
             page_rows = result.rows[: max(0, export_total - page * page_size)]
             for offset, row in enumerate(page_rows):
-                check_search_cancellation(cancellation_event)
                 record = format_full_text_record(
                     row, page * page_size + offset + 1, header_aliases, hidden_headers
                 ).encode("utf-8")
@@ -626,38 +608,16 @@ def run_search(
     *,
     mode: str | None = None,
     count_total: bool = True,
-    cancellation_event: Event | None = None,
 ) -> SearchPage:
     """Run a query in a worker thread with its own short-lived read-only connection."""
     effective_settings = replace(settings, results_per_page=page_size) if page_size else settings
-    # Hydration reads the source CSV after querying SQLite. Keep the lock until
-    # hydration is complete so deletion cannot move the source in between.
-    acquired = False
-    while not acquired:
-        check_search_cancellation(cancellation_event)
-        acquired = DATABASE_OPERATION_LOCK.acquire(timeout=0.1)
+    connection = connect(settings.database_path, readonly=True)
     try:
-        connection = connect(settings.database_path, readonly=True)
-        try:
-            if cancellation_event is not None:
-                connection.set_progress_handler(
-                    lambda: 1 if cancellation_event.is_set() else 0,
-                    1000,
-                )
-            try:
-                return search_records(
-                    connection, query, page, effective_settings, mode=mode, count_total=count_total
-                )
-            except sqlite3.OperationalError as exc:
-                if cancellation_event is not None and cancellation_event.is_set():
-                    raise SearchCancelled from exc
-                raise
-        finally:
-            if cancellation_event is not None:
-                connection.set_progress_handler(None, 0)
-            connection.close()
+        return search_records(
+            connection, query, page, effective_settings, mode=mode, count_total=count_total
+        )
     finally:
-        DATABASE_OPERATION_LOCK.release()
+        connection.close()
 
 
 def run_stats(settings: Settings) -> dict[str, object]:
@@ -705,7 +665,6 @@ async def respond_to_search(
         0,
     ))
     started = time.perf_counter()
-    audit_event_id = start_event(settings, update, query)
     try:
         check_search_cancellation(cancellation_event)
         await status.edit_text(progress_text(
@@ -713,14 +672,7 @@ async def respond_to_search(
             "در حال جست‌وجو در شاخص‌های پایگاه‌داده",
             20,
         ))
-        result = await asyncio.to_thread(
-            run_search,
-            settings,
-            query,
-            0,
-            SEARCH_PREVIEW_LIMIT,
-            cancellation_event=cancellation_event,
-        )
+        result = await asyncio.to_thread(run_search, settings, query, 0, SEARCH_PREVIEW_LIMIT)
         check_search_cancellation(cancellation_event)
         elapsed_ms = (time.perf_counter() - started) * 1000
         LOGGER.info(
@@ -749,7 +701,6 @@ async def respond_to_search(
                 100,
                 detail=f"عبارت جست‌وجو: {escape(query)}\nلطفاً عبارت دیگری را امتحان کنید.",
             ))
-            finish_event(settings, audit_event_id, "no_results", 0, started)
             return
 
         mode_label = {"exact": "دقیق", "prefix": "ابتدای مقدار", "text": "متنی"}.get(
@@ -780,7 +731,6 @@ async def respond_to_search(
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-                finish_event(settings, audit_event_id, "success", result.total_count, started)
                 return
             preview_requires_txt = True
             LOGGER.info(
@@ -865,7 +815,6 @@ async def respond_to_search(
                     progress_callback=export_progress,
                     max_results=SEARCH_EXPORT_MAX_RECORDS,
                     hidden_headers=hidden_headers,
-                    cancellation_event=cancellation_event,
                 )
                 check_search_cancellation(cancellation_event)
                 await stop_export_progress()
@@ -950,11 +899,7 @@ async def respond_to_search(
                 detail,
                 100,
             ))
-            finish_event(settings, audit_event_id, "failed", result.total_count, started)
-        else:
-            finish_event(settings, audit_event_id, "success", result.total_count, started)
     except SearchCancelled:
-        finish_event(settings, audit_event_id, "cancelled", None, started)
         LOGGER.info("operation=search stage=cancelled_by_start user_id=%s", update.effective_user.id)
         try:
             await status.edit_text(progress_text(
@@ -965,7 +910,6 @@ async def respond_to_search(
         except Exception:
             LOGGER.exception("operation=search stage=cancel_status_update_failed user_id=%s", update.effective_user.id)
     except Exception as exc:
-        finish_event(settings, audit_event_id, "failed", None, started)
         _log_exception_redacted(
             "operation=search stage=search_failed user_id=%s query_length=%d error_type=%s"
             % (update.effective_user.id, len(query), type(exc).__name__),
@@ -1031,65 +975,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         cancellation_note += "\nانتخاب ستون فایل ناتمام لغو شد و فایل موقت آن پاک شد."
     if not cancellation_note:
         cancellation_note = "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت."
-    user = update.effective_user
-    display_name = (
-        getattr(user, "first_name", None)
-        or getattr(user, "username", None)
-        or str(user_id)
-    ).strip()
     lines = [
-        f"👋 سلام {display_name} عزیز، خوش آمدید!",
-        "",
-        "🎯 امکانات سامانه:",
-        " ▫️ جستجو اطلاعات براساس نام، شماره موبایل و کدملی",
-        " ▫️ پردازش پرسرعت و اولویت‌بندی شده در صف",
-        "",
-        "برای جستجو، لطفا شماره موبایل یا کدملی یا نام فرد را بطور کامل ارسال کنید",
-    ]
-    if cancellation_note != "جست‌وجوی جاری یا منتظری برای لغو وجود نداشت.":
-        lines.extend(["", cancellation_note])
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 شروع جست‌وجو", callback_data="g:start")],
-            [InlineKeyboardButton("❌ لغو عملیات", callback_data="g:cancel")],
-        ]),
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the user guide without treating /help as a cancellation request."""
-    settings: Settings = context.application.bot_data["settings"]
-    if await deny_if_unauthorized(update, settings):
-        return
-    lines = [
-        "راهنمای استفاده از FinderBot",
-        "عبارت جست‌وجو را مستقیماً بفرستید یا از /search <عبارت> استفاده کنید.",
-        "ربات در ستون‌هایی می‌گردد که هنگام افزودن فایل برای جست‌وجو انتخاب شده‌اند، اما نتیجه اطلاعات کامل همان ردیف را نشان می‌دهد.",
-        "برای لغو جست‌وجوی جاری یا دانلود فایل، /start را بفرستید.",
+        "سلام. عبارت موردنظرتان را همین‌جا بفرستید یا از /search <عبارت> استفاده کنید.",
+        "ربات در ستون‌هایی می‌گردد که هنگام افزودن فایل برای جست‌وجو انتخاب شده‌اند، اما نتیجه، اطلاعات کامل همان ردیف را نشان می‌دهد.",
+        "تا ۵ نتیجه در پیام نمایش داده می‌شود؛ اگر بیشتر باشد، فایل TXT فرستاده می‌شود. خروجی TXT حداکثر ۲۰۰۰ ردیف دارد؛ برای نتیجه‌های بیشتر عبارت را دقیق‌تر کنید.",
+        "برای دیدن آمار از /stats استفاده کنید. اگر پردازشی برایتان در حال انجام است، /start درخواست‌های جست‌وجوی شما را لغو می‌کند.",
     ]
     if upload_authorized(update, settings):
-        lines.append("برای افزودن داده، فایل CSV/TXT یا لینک اشتراک‌گذاری Google Drive را در گفت‌وگوی خصوصی بفرستید.")
-    if is_admin(update.effective_user.id, settings):
-        lines.append("برای دیدن راهنمای کامل مدیریت و دستورات مدیریتی، /admin را بفرستید.")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def guided_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    callback = update.callback_query
-    settings: Settings = context.application.bot_data["settings"]
-    if callback is None or await deny_if_unauthorized(update, settings):
-        return
-    action = (callback.data or "").split(":")[-1]
-    await callback.answer()
-    if action == "start":
-        context.user_data[GUIDED_SEARCH_KEY] = True
-        await callback.message.reply_text(
-            "🔍 عبارت جست‌وجو را بفرستید.\nمثال: علی یا 0912\nبرای لغو، /start را بفرستید."
+        lines.append(
+            "برای افزودن داده، فایل CSV/TXT را در گفت‌وگوی خصوصی بفرستید یا لینک اشتراک‌گذاری فایل CSV/TXT در Google Drive را ارسال کنید."
         )
-    elif action == "cancel":
-        context.user_data.pop(GUIDED_SEARCH_KEY, None)
-        await callback.message.reply_text("عملیات راهنما لغو شد.")
+    else:
+        lines.append("ارسال فایل برای مدیران و کاربران ثبت‌شده فعال است.")
+    if is_admin(user_id, settings):
+        lines.append("برای دیدن پنل مدیریت و دسته‌بندی ابزارها از /admin استفاده کنید.")
+    lines.extend(["", cancellation_note])
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1139,7 +1040,6 @@ async def download_file_with_progress(
     message_id: int,
     filename: str,
     total_bytes: int | None,
-    cancellation_event: Event | None = None,
 ) -> None:
     """Stream a Telegram file to disk and edit one status message periodically.
 
@@ -1210,10 +1110,6 @@ async def download_file_with_progress(
         last_update = 0.0
         with local_source.open("rb") as source, destination.open("wb") as output:
             while chunk := source.read(1024 * 1024):
-                if cancellation_event is not None and cancellation_event.is_set():
-                    raise UploadCancelled
-                if received + len(chunk) > settings.upload_max_bytes:
-                    raise ValueError("Telegram file exceeds the configured upload limit.")
                 output.write(chunk)
                 received += len(chunk)
                 now = time.monotonic()
@@ -1221,8 +1117,6 @@ async def download_file_with_progress(
                     await update_progress(received)
                     last_update = now
         await update_progress(received, complete=True)
-        if expected_bytes is not None and received != expected_bytes:
-            raise ValueError("Telegram file download was incomplete.")
         return
     url = telegram_file_download_url(settings, file_path)
     last_update = 0.0
@@ -1233,10 +1127,6 @@ async def download_file_with_progress(
             response.raise_for_status()
             with destination.open("wb") as output:
                 async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                    if cancellation_event is not None and cancellation_event.is_set():
-                        raise UploadCancelled
-                    if received + len(chunk) > settings.upload_max_bytes:
-                        raise ValueError("Telegram file exceeds the configured upload limit.")
                     output.write(chunk)
                     received += len(chunk)
                     now = time.monotonic()
@@ -1244,15 +1134,12 @@ async def download_file_with_progress(
                         await update_progress(received)
                         last_update = now
     await update_progress(received, complete=True)
-    if expected_bytes is not None and received != expected_bytes:
-        raise ValueError("Telegram file download was incomplete.")
 
 
 async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if await deny_if_unauthorized(update, settings):
         return
-    context.user_data.pop(GUIDED_SEARCH_KEY, None)
     queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
     await queue.submit(update, context, update.effective_message.text or "")
 
@@ -1475,7 +1362,6 @@ async def _download_telegram_document(
     settings: Settings,
     document,
     filename: str,
-    cancellation_event: Event,
 ) -> None:
     message = update.effective_message
     settings.data_directory.mkdir(parents=True, exist_ok=True)
@@ -1500,15 +1386,10 @@ async def _download_telegram_document(
         await download_file_with_progress(
             settings, telegram_file.file_path, temporary_path, context.bot,
             status_message.chat_id, status_message.message_id, filename, document.file_size,
-            cancellation_event,
         )
         actual_size = temporary_path.stat().st_size
         if actual_size > settings.upload_max_bytes:
             temporary_path.unlink(missing_ok=True)
-            context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-            events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
-            if events.get(update.effective_user.id) is cancellation_event:
-                events.pop(update.effective_user.id, None)
             await status_message.edit_text(
                 f"❌ حجم فایل ({actual_size:,} بایت) از سقف تنظیم‌شده ({settings.upload_max_bytes:,} بایت) بیشتر است؛ فایل حذف شد."
             )
@@ -1518,18 +1399,6 @@ async def _download_telegram_document(
             "operation=telegram_upload stage=download_complete filename=%s bytes=%d path=%s",
             filename, actual_size, final_path,
         )
-    except UploadCancelled:
-        temporary_path.unlink(missing_ok=True)
-        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-        events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
-        if events.get(update.effective_user.id) is cancellation_event:
-            events.pop(update.effective_user.id, None)
-        await status_message.edit_text(progress_text(
-            "⚪ دریافت فایل لغو شد",
-            "درخواست با /start لغو شد؛ فایل موقت پاک شد و ورود اطلاعات شروع نشد",
-            100,
-        ))
-        return
     except Exception as exc:
         detail = str(exc).replace(settings.telegram_bot_token, "[REDACTED]")
         _log_exception_redacted(
@@ -1540,10 +1409,6 @@ async def _download_telegram_document(
             document.file_id,
         )
         temporary_path.unlink(missing_ok=True)
-        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-        events = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
-        if events.get(update.effective_user.id) is cancellation_event:
-            events.pop(update.effective_user.id, None)
         await status_message.edit_text(progress_text(
             "❌ دریافت فایل ناموفق بود",
             "مرحلهٔ دریافت از Telegram",
@@ -1562,10 +1427,6 @@ async def _download_telegram_document(
         status_message_id=status_message.message_id,
     )
     await show_upload_header_selection(context, settings, job, status_message)
-    context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
-    events: dict[int, Event] = context.application.bot_data.get(UPLOAD_CANCELLATIONS_KEY, {})
-    if events.get(update.effective_user.id) is cancellation_event:
-        events.pop(update.effective_user.id, None)
 
 
 async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1594,21 +1455,14 @@ async def document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("برای هر حساب هم‌زمان فقط یک فایل را بارگذاری و ستون‌هایش را انتخاب کنید.")
         return
     context.user_data[UPLOAD_TRANSFER_KEY] = "telegram"
-    cancellation_event = Event()
-    context.application.bot_data.setdefault(UPLOAD_CANCELLATIONS_KEY, {})[
-        update.effective_user.id
-    ] = cancellation_event
-    LOGGER.info(
-        "operation=telegram_upload stage=accepted user_id=%s filename=%s expected_bytes=%s",
-        update.effective_user.id, filename, document.file_size,
-    )
-    context.application.create_task(
-        _download_telegram_document(
-            update, context, settings, document, filename, cancellation_event
-        ),
-        update=update,
-        name="telegram-csv-download",
-    )
+    try:
+        LOGGER.info(
+            "operation=telegram_upload stage=accepted user_id=%s filename=%s expected_bytes=%s",
+            update.effective_user.id, filename, document.file_size,
+        )
+        await _download_telegram_document(update, context, settings, document, filename)
+    finally:
+        context.user_data.pop(UPLOAD_TRANSFER_KEY, None)
 def _drive_progress_text(
     filename: str,
     received: int,
@@ -1901,11 +1755,6 @@ def _admin_keyboard(settings: Settings, *, primary_admin: bool = False) -> Inlin
             InlineKeyboardButton("📥 فایل‌ها و دریافت", callback_data="adm:section:uploads"),
             InlineKeyboardButton(mode_label, callback_data=f"adm:mode:{'public' if mode == 'private' else 'private'}"),
         ],
-        [
-            InlineKeyboardButton("🧾 فعالیت جست‌وجو", callback_data="adm:section:audit"),
-            InlineKeyboardButton("📤 گزارش TXT", callback_data="adm:export:menu"),
-        ],
-        [InlineKeyboardButton("⏳ صف جست‌وجوها", callback_data="adm:section:queue")],
     ]
     if primary_admin:
         rows.insert(2, [InlineKeyboardButton("🛡 مدیران ربات", callback_data="adm:section:admins")])
@@ -1945,24 +1794,6 @@ def _admin_panel_text(settings: Settings, *, primary_admin: bool = False) -> str
     )
 
 
-def _audit_dashboard_text(settings: Settings) -> str:
-    metrics = dashboard_metrics(settings)
-    mode = "عمومی" if metrics["mode"] == "public" else "خصوصی"
-    return (
-        f"🔐 دسترسی: {mode}\n"
-        f"🔎 جست‌وجوی امروز: {metrics['total']}\n"
-        f"✅ تکمیل‌شده: {metrics['completed']}\n"
-        f"📭 بدون نتیجه: {metrics['no_results']}\n"
-        f"⚠️ ناموفق: {metrics['failed']}\n"
-        f"⚪ لغوشده: {metrics['cancelled']}\n"
-        f"👥 کاربران جست‌وجوکننده امروز: {metrics['users_today']}\n"
-        f"📅 کاربران هفت روز اخیر: {metrics['users_week']}\n"
-        f"👤 کاربران مجاز: {metrics['users']}\n"
-        f"🗂 دیتاست‌های آماده: {metrics['datasets']}\n"
-        f"📄 رکوردهای ایندکس‌شده: {metrics['records']}"
-    )
-
-
 def _admin_section_view(
     settings: Settings, section: str, *, primary_admin: bool = False
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -1970,11 +1801,7 @@ def _admin_section_view(
     mode_text = "عمومی" if mode == "public" else "خصوصی"
     sections = {
         "status": (
-            "آمار و وضعیت\n" + _audit_dashboard_text(settings)
-        ),
-        "audit": (
-            "🧾 فعالیت جست‌وجو\n" + _audit_dashboard_text(settings)
-            + "\n\nبرای دریافت تاریخچهٔ کامل از دکمهٔ گزارش TXT در پنل استفاده کنید."
+            "آمار و وضعیت\nبرای مشاهدهٔ تعداد رکوردها، حجم دیتابیس و تعداد فایل‌های ایندکس‌شده از /stats استفاده کنید."
         ),
         "data": (
             "فایل‌ها و دیتابیس\nاز /database برای دیدن فایل‌های ایندکس‌شده، جزئیات هر فایل و حذف امن یک دیتاست با تأیید استفاده کنید."
@@ -2054,6 +1881,8 @@ async def _deny_non_primary_admin(update: Update, settings: Settings) -> bool:
 def _user_bot_commands() -> list[BotCommand]:
     return [
         BotCommand("start", "راهنمای استفاده و لغو درخواست جاری"),
+        BotCommand("search", "جست‌وجو با عبارت دلخواه"),
+        BotCommand("stats", "آمار پایگاه‌داده"),
     ]
 
 
@@ -2081,9 +1910,7 @@ def _admin_bot_commands(*, primary_admin: bool) -> list[BotCommand]:
 
 
 async def _sync_user_command_scope(bot, user_id: int, settings: Settings, *, remove_admin: bool = False) -> None:
-    # BotCommandScopeChatMember is only valid for group/supergroup members.
-    # This bot uses private chats, so Telegram requires a chat-specific scope.
-    scope = BotCommandScopeChat(chat_id=int(user_id))
+    scope = BotCommandScopeChatMember(chat_id=int(user_id), user_id=int(user_id))
     try:
         if remove_admin:
             await bot.delete_my_commands(scope=scope)
@@ -2097,7 +1924,7 @@ async def _sync_user_command_scope(bot, user_id: int, settings: Settings, *, rem
 
 
 async def _sync_bot_command_menus(bot, settings: Settings) -> None:
-    """Publish only basic commands publicly and elevated commands per admin chat."""
+    """Publish ordinary commands by default and elevated commands only per admin."""
     try:
         await bot.set_my_commands(_user_bot_commands(), scope=BotCommandScopeDefault())
     except Exception:
@@ -2244,7 +2071,7 @@ def _database_file_view(
     return text, keyboard
 
 
-def _archive_and_delete_database_file_unlocked(
+def _archive_and_delete_database_file(
     settings: Settings,
     file_id: int,
     progress_callback: Callable[[str, float], None] | None = None,
@@ -2308,18 +2135,6 @@ def _archive_and_delete_database_file_unlocked(
         return result, archived_path
     finally:
         connection.close()
-
-
-def _archive_and_delete_database_file(
-    settings: Settings,
-    file_id: int,
-    progress_callback: Callable[[str, float], None] | None = None,
-):
-    """Move a source and remove its index without racing search/import work."""
-    with DATABASE_OPERATION_LOCK:
-        return _archive_and_delete_database_file_unlocked(
-            settings, file_id, progress_callback
-        )
 
 
 async def database_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2545,62 +2360,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if action == "section":
         await callback.answer()
-        if value == "queue":
-            queue = context.application.bot_data.get(SEARCH_QUEUE_KEY)
-            active = queue._active if queue is not None else None
-            waiting = list(queue._queue) if queue is not None else []
-            text = (
-                "⏳ صف جست‌وجوها\n"
-                f"در حال اجرا: {'بله' if active else 'خیر'}\n"
-                f"درخواست‌های منتظر: {len(waiting)}\n"
-                + (f"درخواست فعال: کاربر {active.user_id}\n" if active else "")
-                + ("\n".join(f"#{i} — کاربر {item.user_id} — {item.query[:40]}" for i, item in enumerate(waiting, 1))
-                   if waiting else "صف در حال حاضر خالی است.")
-            )
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm:section:queue")], [InlineKeyboardButton("↩️ بازگشت", callback_data="adm:home:0")]])
-        else:
-            text, keyboard = _admin_section_view(settings, value, primary_admin=primary_admin)
+        text, keyboard = _admin_section_view(settings, value, primary_admin=primary_admin)
         await callback.edit_message_text(text, reply_markup=keyboard)
-        return
-    if action == "export":
-        if not primary_admin:
-            await callback.answer("گزارش فعالیت فقط برای مدیر اصلی مجاز است.", show_alert=True)
-            return
-        if value == "menu":
-            await callback.answer()
-            await callback.edit_message_text(
-                "📤 بازهٔ گزارش فعالیت جست‌وجو را انتخاب کنید:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("امروز", callback_data="adm:export:today")],
-                    [InlineKeyboardButton("۷ روز اخیر", callback_data="adm:export:7d")],
-                    [InlineKeyboardButton("همهٔ تاریخچه", callback_data="adm:export:all")],
-                    [InlineKeyboardButton("↩️ بازگشت", callback_data="adm:home:0")],
-                ]),
-            )
-            return
-        if value not in {"today", "7d", "all"}:
-            await callback.answer("بازهٔ گزارش نامعتبر است.", show_alert=True)
-            return
-        await callback.answer("در حال ساخت گزارش...")
-        temp_fd, temp_name = tempfile.mkstemp(prefix="search-activity-", suffix=".txt")
-        os.close(temp_fd)
-        temp_path = Path(temp_name)
-        try:
-            has_rows = await asyncio.to_thread(export_report, settings, temp_path, value)
-            if not has_rows:
-                await callback.message.reply_text("برای این بازه فعالیت جست‌وجویی ثبت نشده است.")
-            else:
-                with temp_path.open("rb") as report_file:
-                    await callback.message.reply_document(
-                        document=report_file,
-                        filename=f"search_activity_{value}.txt",
-                        caption="گزارش فعالیت جست‌وجو؛ UTF-8",
-                    )
-        except Exception as exc:
-            _log_exception_redacted("operation=admin stage=search_report_failed", exc, settings.telegram_bot_token)
-            await callback.message.reply_text("ساخت یا ارسال گزارش ناموفق بود؛ جزئیات در لاگ ثبت شد.")
-        finally:
-            temp_path.unlink(missing_ok=True)
         return
     if action == "mode" and value in {"private", "public"}:
         connection = connect(settings.database_path)
@@ -2901,29 +2662,6 @@ async def log_update_completed(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def queue_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    callback = update.callback_query
-    settings: Settings = context.application.bot_data["settings"]
-    if callback is None or await deny_if_unauthorized(update, settings):
-        return
-    parts = (callback.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "q" or parts[1] != "cancel":
-        await callback.answer("درخواست نامعتبر است.", show_alert=True)
-        return
-    queue: SearchQueue = context.application.bot_data[SEARCH_QUEUE_KEY]
-    result = queue.cancel_request(parts[2], int(update.effective_user.id))
-    if result == "queued":
-        await callback.answer("جست‌وجو از صف حذف شد.")
-        await callback.edit_message_text("⚪ جست‌وجو لغو شد\nدرخواست پیش از شروع پردازش از صف حذف شد.")
-    elif result == "active":
-        await callback.answer("درخواست لغو شد؛ توقف ایمن در حال انجام است.")
-        await callback.edit_message_text("⏳ درخواست لغو دریافت شد\nدر حال متوقف‌کردن ایمن عملیات جاری...")
-    elif result == "unauthorized":
-        await callback.answer("این درخواست متعلق به شما نیست.", show_alert=True)
-    else:
-        await callback.answer("این درخواست دیگر در صف نیست.", show_alert=True)
-
-
 async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     callback = update.callback_query
@@ -3105,10 +2843,8 @@ def main() -> None:
     application.add_handler(CommandHandler("header_hidden", hidden_headers_command))
     application.add_handler(CommandHandler("drive_setup", drive_setup_command))
     application.add_handler(CallbackQueryHandler(database_management_callback, pattern=r"^db:"))
-    application.add_handler(CallbackQueryHandler(guided_search_callback, pattern=r"^g:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     application.add_handler(CallbackQueryHandler(upload_selection_callback, pattern=r"^u:"))
-    application.add_handler(CallbackQueryHandler(queue_cancel_callback, pattern=r"^q:"))
     application.add_handler(CallbackQueryHandler(page_callback, pattern=r"^p:[A-Za-z0-9_-]+:[0-9]+$"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_upload))
     application.add_handler(MessageHandler(

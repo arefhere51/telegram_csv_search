@@ -7,22 +7,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 import logging
 import sqlite3
-from threading import RLock
 import time
 from typing import Callable, Iterator, Sequence
 
 from config import Settings
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "6"
 LOGGER = logging.getLogger("telegram_csv_search")
 SQLITE_WRITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = 120_000
-DATABASE_OPERATION_LOCK = RLock()
 INDEX_BUILD_RETRIES = 4
 INDEX_RETRY_DELAYS_SECONDS = (1, 2, 4)
 INDEX_PROGRESS_HANDLER_INTERVAL_OPS = 20_000
 INDEX_PROGRESS_MIN_PERCENT_STEP = 1.0
 INDEX_PROGRESS_REPORT_INTERVAL_SECONDS = 2.5
+SQLITE_CACHE_SIZE_KIB = 16 * 1024
 
 
 class DatabaseRebuildRequired(RuntimeError):
@@ -57,9 +56,14 @@ def connect(database_path: Path, *, readonly: bool = False) -> sqlite3.Connectio
     if not readonly:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
-        connection.execute("PRAGMA temp_store = MEMORY")
-        # A bounded page cache protects VPS RAM; SQLite still reads from disk on demand.
-        connection.execute("PRAGMA cache_size = -65536")
+        # Index builds can create very large sort runs. Keep temporary structures on
+        # disk instead of allowing SQLite to grow an unbounded in-memory temp database.
+        connection.execute("PRAGMA temp_store = FILE")
+        connection.execute(f"PRAGMA cache_size = -{SQLITE_CACHE_SIZE_KIB}")
+        connection.execute("PRAGMA temp.cache_size = -4096")
+        connection.execute("PRAGMA cache_spill = ON")
+        # Avoid mapping a multi-GB database into the process address space.
+        connection.execute("PRAGMA mmap_size = 0")
     return connection
 
 
@@ -104,10 +108,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "Keep every source CSV in DATA_DIRECTORY, stop the bot, remove the old "
             "search.db (and its -wal/-shm files), then run `python import_csv.py` to rebuild it."
         )
-    if stored_version not in {None, "2", "3", "4", "5", "6", SCHEMA_VERSION}:
+    if stored_version not in {None, "2", "3", "4", "5", SCHEMA_VERSION}:
         raise DatabaseRebuildRequired(
             f"Unsupported SQLite schema version {stored_version!r}; expected "
-            f"2, 3, 4, 5, 6 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
+            f"2, 3, 4, 5 or {SCHEMA_VERSION}. Rebuild the database from the CSV files in DATA_DIRECTORY."
         )
     connection.executescript(
         """
@@ -187,26 +191,6 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         ) WITHOUT ROWID;
 
-        CREATE TABLE IF NOT EXISTS search_activity (
-            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            completed_at TEXT,
-            telegram_user_id INTEGER NOT NULL,
-            first_name TEXT NOT NULL DEFAULT '',
-            last_name TEXT NOT NULL DEFAULT '',
-            display_name TEXT NOT NULL DEFAULT '',
-            username TEXT NOT NULL DEFAULT '',
-            dataset_name TEXT NOT NULL DEFAULT 'همهٔ دیتاست‌ها',
-            query_text TEXT,
-            status TEXT NOT NULL,
-            result_count INTEGER,
-            duration_ms INTEGER
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_search_activity_started ON search_activity(started_at);
-        CREATE INDEX IF NOT EXISTS idx_search_activity_user ON search_activity(telegram_user_id);
-        CREATE INDEX IF NOT EXISTS idx_search_activity_status ON search_activity(status);
-
         CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file_id);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS records_all_fts USING fts5(
@@ -244,6 +228,12 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     connection.execute(
         "INSERT OR IGNORE INTO metadata(key, value) VALUES ('search_indexes_ready', '0')"
     )
+    # Existing databases that were already marked ready necessarily had a completed
+    # FTS build; use that state when introducing resumable indexing metadata.
+    connection.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) "
+        "SELECT 'search_fts_ready', value FROM metadata WHERE key = 'search_indexes_ready'"
+    )
     connection.commit()
 
 
@@ -261,18 +251,17 @@ def set_metadata(connection: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def initialize_access_control(connection: sqlite3.Connection, settings: Settings) -> None:
-    """Seed configured users without removing users managed from inside the bot."""
+    """Seed private-mode users once; later changes made by admins remain persistent."""
     mode = get_metadata(connection, "access_mode")
     if mode not in {"private", "public"}:
         set_metadata(connection, "access_mode", settings.initial_access_mode)
-    # Reconcile additions from .env on every startup. Existing database-managed
-    # users are deliberately not removed when an environment variable changes.
-    for user_id in sorted(settings.allowed_user_ids | settings.admin_user_ids):
-        connection.execute(
-            "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
-            (user_id, 0, utc_now()),
-        )
-    set_metadata(connection, "access_bootstrap_done", "1")
+    if get_metadata(connection, "access_bootstrap_done") != "1":
+        for user_id in sorted(settings.allowed_user_ids | settings.admin_user_ids):
+            connection.execute(
+                "INSERT OR IGNORE INTO bot_users(user_id, added_by, created_at) VALUES (?, ?, ?)",
+                (user_id, 0, utc_now()),
+            )
+        set_metadata(connection, "access_bootstrap_done", "1")
     connection.commit()
 
 
@@ -453,7 +442,7 @@ def build_search_indexes(
     force: bool = False,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> None:
-    """Build exact/prefix B-tree indexes and rebuild FTS after an initial bulk import."""
+    """Build indexes in disk-backed, restartable stages to bound peak memory."""
     original_progress_callback = progress_callback
 
     def progress_callback(stage: str, percent: float) -> None:
@@ -476,45 +465,67 @@ def build_search_indexes(
         "CREATE INDEX IF NOT EXISTS idx_records_birth_date_norm ON records(birth_date_norm)",
         "CREATE INDEX IF NOT EXISTS idx_records_record_hash ON records(record_hash)",
     )
+    force_rebuild_pending = force
+    force_fts_pending = force
+    force_indexes_pending = {statement.split()[5] for statement in index_statements} if force else set()
     for attempt in range(INDEX_BUILD_RETRIES):
         try:
             if progress_callback:
                 progress_callback("انتظار برای آزادشدن پایگاه‌داده", 0.0)
-            # Acquire SQLite's single-writer slot before doing the expensive FTS rebuild.
-            # Re-check after acquiring it so concurrent initializers do not rebuild twice.
             connection.execute("BEGIN IMMEDIATE")
-            if search_indexes_ready(connection) and not force:
+            if search_indexes_ready(connection) and not force_rebuild_pending:
                 connection.commit()
                 if progress_callback:
                     progress_callback("شاخص‌ها توسط فرایند دیگری آماده شدند", 100.0)
                 return
-            if progress_callback:
-                progress_callback("قفل نوشتن گرفته شد؛ آماده‌سازی FTS", 5.0)
+            if force_rebuild_pending:
+                # Make an interrupted forced rebuild visible and safe to resume.
+                set_metadata(connection, "search_indexes_ready", "0")
+                set_metadata(connection, "search_fts_ready", "0")
+                connection.commit()
+                force_rebuild_pending = False
+            else:
+                connection.commit()
+
             record_count = int(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0])
-            changes_before_rebuild = connection.total_changes
-            last_fts_percent = 5.0
+            fts_ready = get_metadata(connection, "search_fts_ready", "0") == "1"
+            if force_fts_pending or not fts_ready:
+                if progress_callback:
+                    progress_callback("قفل نوشتن گرفته شد؛ آماده‌سازی FTS", 5.0)
+                connection.execute("BEGIN IMMEDIATE")
+                # Another process may have completed this durable stage while we waited.
+                if not force_fts_pending and get_metadata(connection, "search_fts_ready", "0") == "1":
+                    connection.commit()
+                else:
+                    changes_before_rebuild = connection.total_changes
+                    last_fts_percent = 5.0
 
-            def report_fts_progress() -> int:
-                nonlocal last_fts_percent
-                if progress_callback and record_count:
-                    changed = max(0, connection.total_changes - changes_before_rebuild)
-                    # SQLite's total_changes is a useful approximation for FTS5 rebuild work.
-                    # Clamp it below completion; the statement's return is the authoritative end.
-                    percent = min(50.0, 5.0 + 45.0 * changed / record_count)
-                    if percent >= last_fts_percent + 2.0:
-                        last_fts_percent = percent
-                        progress_callback("بازسازی شاخص متنی FTS", percent)
-                return 0
+                    def report_fts_progress() -> int:
+                        nonlocal last_fts_percent
+                        if progress_callback and record_count:
+                            changed = max(0, connection.total_changes - changes_before_rebuild)
+                            percent = min(50.0, 5.0 + 45.0 * changed / record_count)
+                            if percent >= last_fts_percent + 2.0:
+                                last_fts_percent = percent
+                                progress_callback("بازسازی شاخص متنی FTS", percent)
+                        return 0
 
-            if progress_callback:
-                progress_callback("بازسازی شاخص متنی FTS", 5.0)
-            connection.set_progress_handler(report_fts_progress, 20_000)
-            try:
-                connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
-            finally:
-                connection.set_progress_handler(None, 0)
-            if progress_callback:
-                progress_callback("بازسازی شاخص متنی FTS کامل شد", 52.0)
+                    if progress_callback:
+                        progress_callback("بازسازی شاخص متنی FTS", 5.0)
+                    connection.set_progress_handler(report_fts_progress, 20_000)
+                    try:
+                        connection.execute("INSERT INTO records_all_fts(records_all_fts) VALUES ('rebuild')")
+                    finally:
+                        connection.set_progress_handler(None, 0)
+                    set_metadata(connection, "search_fts_ready", "1")
+                    connection.commit()
+                    force_fts_pending = False
+                    connection.execute("PRAGMA shrink_memory")
+                if progress_callback:
+                    progress_callback("بازسازی شاخص متنی FTS کامل شد", 52.0)
+            elif progress_callback:
+                progress_callback("شاخص متنی FTS از قبل آماده است", 52.0)
+
             for index_number, statement in enumerate(index_statements):
                 index_name = statement.split()[5]
                 start_percent = 52.0 + index_number * 6.0
@@ -548,23 +559,31 @@ def build_search_indexes(
                         last_reported_percent = current_percent
                     return 0
 
-                connection.set_progress_handler(
-                    report_index_progress, INDEX_PROGRESS_HANDLER_INTERVAL_OPS
-                )
+                connection.execute("BEGIN IMMEDIATE")
                 try:
-                    connection.execute(statement)
+                    if index_name in force_indexes_pending:
+                        connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+                    exists = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                        (index_name,),
+                    ).fetchone()
+                    if not exists:
+                        connection.set_progress_handler(
+                            report_index_progress, INDEX_PROGRESS_HANDLER_INTERVAL_OPS
+                        )
+                        connection.execute(statement)
+                    connection.commit()
+                    force_indexes_pending.discard(index_name)
                 finally:
                     connection.set_progress_handler(None, 0)
+                connection.execute("PRAGMA shrink_memory")
                 if progress_callback:
                     progress_callback(f"شاخص {index_name} ساخته شد", start_percent + 6.0)
-            if force:
-                if progress_callback:
-                    progress_callback("بازسازی نهایی شاخص‌های B-tree", 90.0)
-                connection.execute("REINDEX")
-                if progress_callback:
-                    progress_callback("بازسازی نهایی B-tree کامل شد", 97.0)
+
+            connection.execute("BEGIN IMMEDIATE")
             set_metadata(connection, "search_indexes_ready", "1")
             connection.commit()
+            connection.execute("PRAGMA shrink_memory")
             if progress_callback:
                 progress_callback("ساخت همهٔ شاخص‌ها کامل شد", 100.0)
             return

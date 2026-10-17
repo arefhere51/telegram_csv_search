@@ -14,13 +14,7 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from config import Settings
-from database import (
-    DATABASE_OPERATION_LOCK,
-    build_search_indexes,
-    connect,
-    initialize_database,
-    seed_dedupe_hashes,
-)
+from database import build_search_indexes, connect, initialize_database, seed_dedupe_hashes
 from import_csv import import_one_file
 from progress_utils import RemainingTimeEstimator, progress_text
 
@@ -153,7 +147,7 @@ class UploadManager:
             job,
             progress_text(
                 "📥 آماده‌سازی فایل",
-                "نوبت ورود اطلاعات این فایل رسیده است",
+                f"در صف ورود اطلاعات؛ موقعیت {position}",
                 0,
                 detail=job.original_filename,
             ),
@@ -312,30 +306,28 @@ class UploadManager:
             }
 
         def import_sync() -> tuple[int, int]:
-            with DATABASE_OPERATION_LOCK:
-                connection = connect(self.settings.database_path)
-                try:
-                    initialize_database(connection)
-                    if self.settings.duplicate_mode == "exact":
-                        seed_dedupe_hashes(connection)
-                    processed, inserted = import_one_file(
-                        connection, job.path, self.settings,
-                        telegram_metadata=metadata,
-                        progress_callback=progress,
-                        selected_column_indices=job.selected_column_indices,
-                    )
-                    return processed, inserted
-                finally:
-                    connection.close()
+            connection = connect(self.settings.database_path)
+            try:
+                initialize_database(connection)
+                if self.settings.duplicate_mode == "exact":
+                    seed_dedupe_hashes(connection)
+                processed, inserted = import_one_file(
+                    connection, job.path, self.settings,
+                    telegram_metadata=metadata,
+                    progress_callback=progress,
+                    selected_column_indices=job.selected_column_indices,
+                )
+                return processed, inserted
+            finally:
+                connection.close()
 
         def build_indexes_sync() -> None:
-            with DATABASE_OPERATION_LOCK:
-                connection = connect(self.settings.database_path)
-                try:
-                    initialize_database(connection)
-                    build_search_indexes(connection, progress_callback=index_progress)
-                finally:
-                    connection.close()
+            connection = connect(self.settings.database_path)
+            try:
+                initialize_database(connection)
+                build_search_indexes(connection, progress_callback=index_progress)
+            finally:
+                connection.close()
 
         try:
             LOGGER.info(
